@@ -1,0 +1,34 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://relaxng.org/ns/structure/1.0"?>
+<package format="3">
+  <name>lio_localization</name>
+  <version>0.1.0</version>
+  <description>
+    Prior-map localization for FAST-LIO: a ROS 2 C++/PCL port of
+    HViktorTsoi/FAST_LIO_LOCALIZATION, adapted to this repo's FAST-LIO frame
+    contract (map -> odom -> base_footprint). global_localization registers
+    FAST-LIO's /cloud_registered against a saved .pcd map via PCL ICP and
+    publishes the map->odom correction; transform_fusion broadcasts it as TF at
+    high rate. No Open3D dependency. Replaces the runtime pgo_map_odom_bridge
+    for localization runs.
+  </description>
+  <maintainer email="yohatad@gmail.com">yoha</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>nav_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>tf2</depend>
+  <depend>tf2_ros</depend>
+  <depend>pcl_conversions</depend>
+  <depend>eigen</depend>
+  <depend>libpcl-all-dev</depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
