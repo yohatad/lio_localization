@@ -98,6 +98,14 @@ def generate_launch_description():
                     'and no map -> odom_lidar was ever published. At 0.70 the same '
                     'bag locks at 0.978. Raise it if you see it locking onto the '
                     'wrong place; lower it further if it never locks at all.')
+    declare_freq_cmd = DeclareLaunchArgument(
+        'freq_localization', default_value='2.0',
+        description='ICP corrections per second. Upstream shipped 0.5 Hz, which '
+                    'leaves the pose frozen for 2 s at a time -- on a moving '
+                    'robot the next ICP then starts from a stale seed. Each '
+                    'match measured 25-75 ms here, so 2 Hz is ~10% duty cycle '
+                    'and 5 Hz is still comfortable. Raise for faster motion, '
+                    'lower if CPU-bound.')
 
     # base_footprint -> l2lidar_frame -> l2lidar_frame_imu (+ cams). The lio bridge
     # needs the static base_footprint -> l2lidar_frame_imu to close odom->base_footprint.
@@ -139,7 +147,8 @@ def generate_launch_description():
             'odom_frame': 'odom_lidar',
             'map_voxel_size': 0.4,
             'scan_voxel_size': 0.1,
-            'freq_localization': 0.5,
+            'freq_localization': ParameterValue(
+                LaunchConfiguration('freq_localization'), value_type=float),
             'localization_th': ParameterValue(localization_th, value_type=float),
             'fov': 6.28,        # L2 is 360 deg -> ring crop (distance only)
             'fov_far': 30.0,
@@ -168,6 +177,7 @@ def generate_launch_description():
     ld.add_action(declare_rviz_cfg_cmd)
     ld.add_action(declare_use_sim_time_cmd)
     ld.add_action(declare_localization_th_cmd)
+    ld.add_action(declare_freq_cmd)
     ld.add_action(OpaqueFunction(function=_check_map_pcd_exists))
     ld.add_action(sensor_tf_launch)
     ld.add_action(point_lio_launch)
