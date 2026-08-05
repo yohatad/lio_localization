@@ -58,9 +58,13 @@ def generate_launch_description():
         'use_sim_time', default_value='true',
         description='true for bag replay (--clock); false on the robot.')
     declare_localization_th_cmd = DeclareLaunchArgument(
-        'localization_th', default_value='0.90',
-        description='Min ICP inlier-ratio fitness to accept a match. Lower if the '
-                    'L2 scan only partly overlaps the prior map (0.6-0.9 typical).')
+        'localization_th', default_value='0.70',
+        description='Min ICP inlier-ratio fitness to accept a match. 0.90 was '
+                    'upstream\'s value and is too strict for the L2 on this rig: '
+                    'measured 0.793 on bags/July_22, so EVERY match was rejected '
+                    'and no map -> odom_lidar was ever published. At 0.70 the same '
+                    'bag locks at 0.978. Raise it if you see it locking onto the '
+                    'wrong place; lower it further if it never locks at all.')
 
     # base_footprint -> l2lidar_frame -> l2lidar_frame_imu (+ cams). The lio bridge
     # needs the static base_footprint -> l2lidar_frame_imu to close odom->base_footprint.
