@@ -62,8 +62,8 @@ def generate_launch_description():
         description='Min ICP inlier-ratio fitness to accept a match. Lower if the '
                     'L2 scan only partly overlaps the prior map (0.6-0.9 typical).')
 
-    # base_footprint -> l2lidar_frame -> l2lidar_imu (+ cams). The lio bridge
-    # needs the static base_footprint -> l2lidar_imu to close odom->base_footprint.
+    # base_footprint -> l2lidar_frame -> l2lidar_frame_imu (+ cams). The lio bridge
+    # needs the static base_footprint -> l2lidar_frame_imu to close odom->base_footprint.
     sensor_tf_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(sensor_tf_share, 'launch', 'pepper_sensor_tf.launch.py')),
