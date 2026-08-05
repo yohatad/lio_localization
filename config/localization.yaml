@@ -1,0 +1,69 @@
+# Runtime tuning for global_localization / transform_fusion.
+#
+# Edit and RELAUNCH -- no rebuild -- by pointing the launch at this file
+# directly rather than at the installed copy:
+#
+#   ros2 launch lio_localization fastlio_localization_l2.launch.py \
+#       params_file:=$HOME/ros2_ws/src/lio_localization/config/localization.yaml
+#
+# (The installed copy under install/ is only refreshed by colcon build, which is
+# why the source path is the one to use while tuning.)
+#
+# Values here are overridden by any explicit launch argument, so
+# `localization_th:=0.5` on the command line still wins for a one-off test.
+
+/**:
+  ros__parameters:
+
+    # --- what ICP matches against ------------------------------------------
+    # Radius the prior map is cropped to around the current estimate: the
+    # SEARCH AREA. ICP never sees outside it, so a seed further off than this
+    # cannot recover. 20 m suits a single room; raise it if the initial pose
+    # may be badly wrong, lower it to reduce the chance of latching onto a
+    # similar-looking region elsewhere in the building.
+    fov_far: 10.0
+
+    # Voxel leaf the prior .pcd is downsampled to on load.
+    # MEASURED on bags/July_22: 0.4 gave 423 mm of correction jitter, 0.15 gave
+    # ~400 mm, 0.05 gave 755 mm. Finer is NOT better here -- a denser map gives
+    # point-to-point ICP more spurious correspondences on flat walls.
+    map_voxel_size: 0.4
+
+    # Voxel leaf for the live scan. 0.1 leaves only ~400 points, which is thin;
+    # lowering it gives ICP more to constrain against, at CPU cost. Untested.
+    scan_voxel_size: 0.05
+
+    # --- ICP itself ---------------------------------------------------------
+    # Correspondence radius at the fine scale, AND the radius the inlier-ratio
+    # fitness is measured over -- deliberately the same number, so fitness
+    # means "fraction that actually aligned".
+    #
+    # THIS COUPLES TO localization_th. MEASURED: at 0.25 a good lock scores
+    # only 0.53, at 0.5 it scores 0.61, at 1.0 it scores 0.98 -- because that
+    # is how well the scan and this prior map genuinely agree. Tightening it
+    # also made the jitter WORSE (533 mm at 0.5, 1053 mm at 0.75, vs 423 mm at
+    # 1.0), so the sliding-along-walls theory did not hold.
+    max_corr_dist: 0.25
+    icp_iterations: 40
+
+    # --- acceptance ---------------------------------------------------------
+    # Minimum inlier-ratio fitness to accept a match and publish a correction.
+    # 0.95 is only reachable with max_corr_dist 1.0 (measured 0.98 there); at
+    # any tighter radius a GOOD lock scores 0.53-0.61 and everything is
+    # rejected, leaving no map frame at all.
+    localization_th: 0.85
+
+    # --- rate ---------------------------------------------------------------
+    # ICP corrections per second. MEASURED: 2 Hz gives 153 mm median correction
+    # steps vs 352 mm at upstream's 0.5 Hz, because less drift accumulates
+    # between corrections. Each match costs 25-75 ms, so 2 Hz is ~10% duty.
+    freq_localization: 1.0
+
+    # Rate transform_fusion rebroadcasts the latest correction as TF.
+    fusion_rate: 50.0
+
+    # --- seeding ------------------------------------------------------------
+    # Treat /initialpose as the ROBOT's pose in map (what RViz publishes) and
+    # compose out odom->base internally, rather than assuming it is already a
+    # map->odom seed. Leave true.
+    initial_pose_is_base: true

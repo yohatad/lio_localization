@@ -120,6 +120,8 @@ public:
     SCAN_VOXEL_ = declare_parameter<double>("scan_voxel_size", 0.1);
     FREQ_ = declare_parameter<double>("freq_localization", 0.5);
     LOCALIZATION_TH_ = declare_parameter<double>("localization_th", 0.90);
+    MAX_CORR_DIST_ = declare_parameter<double>("max_corr_dist", 0.25);
+    ICP_ITERS_ = declare_parameter<int>("icp_iterations", 40);
     FOV_ = declare_parameter<double>("fov", 6.28);        // >pi -> ring lidar
     FOV_FAR_ = declare_parameter<double>("fov_far", 30.0);
 
@@ -267,13 +269,21 @@ private:
     pcl::IterativeClosestPoint<PointT, PointT> icp;
     icp.setInputSource(scan_ds);
     icp.setInputTarget(map_ds);
-    icp.setMaxCorrespondenceDistance(1.0 * scale);
-    icp.setMaximumIterations(20);
+    // Upstream hardcoded 1.0 m at the fine scale, which is very loose: a scan
+    // point pairs with a map point up to a metre away. On the large flat walls
+    // this rig sees, that is exactly what lets the solution SLIDE along a
+    // surface while every point still finds a partner -- measured as ~423 mm
+    // of zero-mean jitter in map->odom (net/sum ratio 0.09, i.e. 91% of the
+    // motion cancelled out) at fitness 0.98. Tightening it penalises sliding.
+    icp.setMaxCorrespondenceDistance(MAX_CORR_DIST_ * scale);
+    icp.setMaximumIterations(ICP_ITERS_);
 
     Cloud aligned;
     icp.align(aligned, guess);
     Eigen::Matrix4f T = icp.getFinalTransformation();
-    fitness_out = inlierFitness(aligned, map_ds, 1.0 * scale);
+    // Same radius as the solver, deliberately: fitness then means "fraction of
+    // points that actually aligned", not "fraction within a metre of anything".
+    fitness_out = inlierFitness(aligned, map_ds, MAX_CORR_DIST_ * scale);
     return T;
   }
 
@@ -388,6 +398,8 @@ private:
   std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
   std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
   double MAP_VOXEL_, SCAN_VOXEL_, FREQ_, LOCALIZATION_TH_, FOV_, FOV_FAR_;
+  double MAX_CORR_DIST_{0.25};
+  int ICP_ITERS_{40};
 
   // state
   Cloud::Ptr global_map_;

@@ -91,7 +91,7 @@ def generate_launch_description():
         'use_sim_time', default_value='true',
         description='true for bag replay (--clock); false on the robot.')
     declare_localization_th_cmd = DeclareLaunchArgument(
-        'localization_th', default_value='0.70',
+        'localization_th', default_value='0.95',
         description='Min ICP inlier-ratio fitness to accept a match. 0.90 was '
                     'upstream\'s value and is too strict for the L2 on this rig: '
                     'measured 0.793 on bags/July_22, so EVERY match was rejected '
@@ -140,18 +140,16 @@ def generate_launch_description():
         name='point_lio_localization',
         output='screen',
         remappings=[('/Odometry', POINT_LIO_ODOM_TOPIC)],
-        parameters=[{
+        # params_file FIRST, then only the values that must come from launch
+        # context. Anything appearing in BOTH would be won by this dict, which
+        # silently made the YAML inert for every tunable in it.
+        parameters=[LaunchConfiguration('params_file'), {
             'use_sim_time': use_sim_time,
             'map_pcd': map_pcd,
             'map_frame': 'map',
             'odom_frame': 'odom_lidar',
-            'map_voxel_size': 0.4,
             'scan_voxel_size': 0.1,
-            'freq_localization': ParameterValue(
-                LaunchConfiguration('freq_localization'), value_type=float),
-            'localization_th': ParameterValue(localization_th, value_type=float),
             'fov': 6.28,        # L2 is 360 deg -> ring crop (distance only)
-            'fov_far': 30.0,
         }],
     )
 
@@ -162,7 +160,10 @@ def generate_launch_description():
         name='transform_fusion',
         output='screen',
         remappings=[('/Odometry', POINT_LIO_ODOM_TOPIC)],
-        parameters=[{
+        # params_file FIRST, then only the values that must come from launch
+        # context. Anything appearing in BOTH would be won by this dict, which
+        # silently made the YAML inert for every tunable in it.
+        parameters=[LaunchConfiguration('params_file'), {
             'use_sim_time': use_sim_time,
             'map_frame': 'map',
             'odom_frame': 'odom_lidar',
@@ -171,6 +172,46 @@ def generate_launch_description():
         }],
     )
 
+    declare_mapvox_cmd = DeclareLaunchArgument(
+        'map_voxel_size', default_value='0.15',
+        description='Voxel leaf the PRIOR MAP is downsampled to on load. This '
+                    'is the precision floor for the whole stack: ICP cannot '
+                    'localize finer than the map it matches against. Upstream '
+                    'shipped 0.4 m, and measured map->odom corrections sat at '
+                    '150-370 mm -- the same scale. Smaller = finer but more '
+                    'points and slower ICP.')
+
+    declare_corr_cmd = DeclareLaunchArgument(
+        'max_corr_dist', default_value='0.25',
+        description='ICP correspondence radius at the fine scale, and the radius '
+                    'the inlier-ratio fitness is measured over -- deliberately the '
+                    'same number, so fitness means "fraction that actually aligned" '
+                    'rather than "fraction within a metre of anything". Upstream '
+                    'used 1.0 m, which on large flat walls lets the solution slide '
+                    'along the surface while every point keeps a partner: measured '
+                    '423 mm of zero-mean jitter at fitness 0.98. NOTE this couples '
+                    'to localization_th -- tightening the radius lowers fitness, so '
+                    'the two must be tuned together.')
+
+    declare_fovfar_cmd = DeclareLaunchArgument(
+        'fov_far', default_value='10.0',
+        description='Radius (m) the prior map is cropped to around the current '
+                    'estimate each cycle -- the SEARCH AREA. ICP only ever sees '
+                    'inside this ball, so a seed further off than this can never '
+                    'recover. Bigger = more tolerant of a bad initial pose, but '
+                    'more map points per ICP and more chance of latching onto a '
+                    'similar-looking region elsewhere. The L2 itself only returns '
+                    'to ~30 m, so beyond that you are adding map with no scan to '
+                    'match it against.')
+
+    declare_params_cmd = DeclareLaunchArgument(
+        'params_file',
+        default_value=os.path.join(localization_share, 'config', 'localization.yaml'),
+        description='YAML of runtime tunables. Point this at the SOURCE copy '
+                    '(src/lio_localization/config/localization.yaml) to edit and '
+                    'relaunch without rebuilding. Explicit launch arguments still '
+                    'override whatever is in the file.')
+
     ld = LaunchDescription()
     ld.add_action(declare_map_pcd_cmd)
     ld.add_action(declare_rviz_cmd)
@@ -178,6 +219,10 @@ def generate_launch_description():
     ld.add_action(declare_use_sim_time_cmd)
     ld.add_action(declare_localization_th_cmd)
     ld.add_action(declare_freq_cmd)
+    ld.add_action(declare_mapvox_cmd)
+    ld.add_action(declare_corr_cmd)
+    ld.add_action(declare_fovfar_cmd)
+    ld.add_action(declare_params_cmd)
     ld.add_action(OpaqueFunction(function=_check_map_pcd_exists))
     ld.add_action(sensor_tf_launch)
     ld.add_action(point_lio_launch)
