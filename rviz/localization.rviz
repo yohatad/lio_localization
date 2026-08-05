@@ -1,267 +1,225 @@
-# RViz config for ICP localization against a prior map (fastlio_localization_l2
-# and pointlio_localization_l2). Both launches previously defaulted to a MAPPING
-# config whose Fixed Frame was 'odom'; see the notes below for why that is the
-# wrong frame here.
-#
-# FIXED FRAME IS 'map'. In localization the whole point is watching the
-# correction, and the correction lives in map -> odom_lidar. Viewed from 'odom'
-# the prior map lurches around a stationary robot on every ICP update -- the
-# same information, rendered backwards. From 'map' the map holds still and the
-# robot snaps, which is what you actually want to judge.
-#
-# THE TWO CLOUDS THAT MATTER are Submap (the prior-map region ICP is matching
-# against, grey) and ScanInMap (the live scan pushed through the current
-# estimate, rainbow). Their overlap IS the localization quality -- no metric
-# needed, you can see a bad lock. They are deliberately coloured differently so
-# they never blur together.
-#
-# TOPIC NOTE: no /Odometry display. FAST-LIO publishes /Odometry, Point-LIO
-# publishes /aft_mapped_to_init, and the launch-time remap that reconciles them
-# applies to the C++ nodes, not to RViz -- so any such display is dead for one
-# backend or the other. /localization (from transform_fusion) is the
-# backend-agnostic pose and is used instead.
 Panels:
-  - Class: rviz_common/Displays
-    Help Height: 78
-    Name: Displays
-    Property Tree Widget:
-      Expanded:
-        - /Global Options1
-        - /Submap1
-        - /ScanInMap1
-        - /Localization1
-      Splitter Ratio: 0.5
-    Tree Height: 1400
-  - Class: rviz_common/Selection
-    Name: Selection
-  - Class: rviz_common/Tool Properties
+- Class: rviz_common/Displays
+  Help Height: 78
+  Name: Displays
+  Property Tree Widget:
     Expanded:
-      - /2D Pose Estimate1
-    Name: Tool Properties
-    Splitter Ratio: 0.5886790156364441
-  - Class: rviz_common/Views
-    Expanded:
-      - /Current View1
-    Name: Views
+    - /Global Options1
+    - /Submap1
+    - /ScanInMap1
+    - /Localization1
     Splitter Ratio: 0.5
-  - Class: rviz_common/Time
-    Experimental: false
-    Name: Time
-    SyncMode: 0
-    SyncSource: ScanInMap
+  Tree Height: 1400
+- Class: rviz_common/Selection
+  Name: Selection
+- Class: rviz_common/Tool Properties
+  Expanded:
+  - /2D Pose Estimate1
+  Name: Tool Properties
+  Splitter Ratio: 0.5886790156364441
+- Class: rviz_common/Views
+  Expanded:
+  - /Current View1
+  Name: Views
+  Splitter Ratio: 0.5
+- Class: rviz_common/Time
+  Experimental: false
+  Name: Time
+  SyncMode: 0
+  SyncSource: ScanInMap
 Visualization Manager:
-  Class: ""
+  Class: ''
   Displays:
-    - Class: rviz_default_plugins/TF
-      Enabled: true
-      Frame Timeout: 15
-      Frames:
-        All Enabled: false
-        base_footprint:
-          Value: true
-        l2lidar_frame:
-          Value: true
-        map:
-          Value: true
-        odom:
-          Value: true
-        odom_lidar:
-          Value: true
-      Marker Scale: 0.5
-      Name: TF
-      Show Arrows: false
-      Show Axes: true
-      Show Names: true
-      Tree:
-        {}
-      Update Interval: 0
-      Value: true
-
-    # The prior map, cropped to what ICP is currently matching against.
-    # Flat grey on purpose: it is the reference, not the measurement.
-    - Alpha: 0.6
-      Autocompute Intensity Bounds: true
-      Autocompute Value Bounds:
-        Max Value: 10
-        Min Value: -10
+  - Class: rviz_default_plugins/TF
+    Enabled: true
+    Frame Timeout: 15
+    Frames:
+      All Enabled: false
+      base_footprint:
         Value: true
-      Axis: Z
-      Channel Name: intensity
-      Class: rviz_default_plugins/PointCloud2
-      Color: 140; 140; 140
-      Color Transformer: FlatColor
-      Decay Time: 0
-      Enabled: true
-      Invert Rainbow: false
-      Max Color: 255; 255; 255
-      Min Color: 0; 0; 0
-      Name: Submap
-      Position Transformer: XYZ
-      Selectable: true
-      Size (Pixels): 2
-      Size (m): 0.02
-      Style: Flat Squares
-      Topic:
-        Depth: 5
-        Durability Policy: Volatile
-        Filter size: 10
-        History Policy: Keep Last
-        Reliability Policy: Reliable
-        Value: /submap
-      Use Fixed Frame: true
-      Use rainbow: true
-      Value: true
-
-    # The live scan pushed through the current estimate. Where this sits on top
-    # of Submap, the lock is good; where it ghosts beside it, it is not.
-    - Alpha: 1
-      Autocompute Intensity Bounds: true
-      Autocompute Value Bounds:
-        Max Value: 3
-        Min Value: -1
+      l2lidar_frame:
         Value: true
-      Axis: Z
-      Channel Name: intensity
-      Class: rviz_default_plugins/PointCloud2
-      Color: 255; 255; 255
-      Color Transformer: AxisColor
-      Decay Time: 0
-      Enabled: true
-      Invert Rainbow: false
-      Max Color: 255; 255; 255
-      Min Color: 0; 0; 0
-      Name: ScanInMap
-      Position Transformer: XYZ
-      Selectable: true
-      Size (Pixels): 3
-      Size (m): 0.03
-      Style: Flat Squares
-      Topic:
-        Depth: 5
-        Durability Policy: Volatile
-        Filter size: 10
-        History Policy: Keep Last
-        Reliability Policy: Reliable
-        Value: /cur_scan_in_map
-      Use Fixed Frame: true
-      Use rainbow: true
-      Value: true
-
-    # Live LIO cloud, stamped in odom_lidar and transformed here by TF. Off by
-    # default -- it overlaps ScanInMap and mostly just adds clutter. Enable it
-    # to tell "the LIO is fine, the ICP lock is bad" from "the LIO itself broke".
-    - Alpha: 1
-      Autocompute Intensity Bounds: true
-      Autocompute Value Bounds:
-        Max Value: 4
-        Min Value: -1
+      map:
         Value: true
-      Axis: Z
-      Channel Name: intensity
-      Class: rviz_default_plugins/PointCloud2
-      Color: 255; 255; 255
-      Color Transformer: Intensity
-      Decay Time: 0
-      Enabled: false
-      Invert Rainbow: false
-      Max Color: 255; 255; 255
-      Min Color: 0; 0; 0
-      Name: CloudRegistered
-      Position Transformer: XYZ
-      Selectable: true
-      Size (Pixels): 2
-      Size (m): 0.01
-      Style: Flat Squares
-      Topic:
-        Depth: 5
-        Durability Policy: Volatile
-        Filter size: 10
-        History Policy: Keep Last
-        Reliability Policy: Reliable
-        Value: /cloud_registered
-      Use Fixed Frame: true
-      Use rainbow: true
+      odom:
+        Value: true
+      odom_lidar:
+        Value: true
+    Marker Scale: 0.5
+    Name: TF
+    Show Arrows: false
+    Show Axes: true
+    Show Names: true
+    Tree: {}
+    Update Interval: 0
+    Value: true
+  - Alpha: 1.0
+    Autocompute Intensity Bounds: true
+    Autocompute Value Bounds:
+      Max Value: 10
+      Min Value: -10
+      Value: true
+    Axis: Z
+    Channel Name: intensity
+    Class: rviz_default_plugins/PointCloud2
+    Color: 150; 150; 160
+    Color Transformer: FlatColor
+    Decay Time: 0
+    Enabled: true
+    Invert Rainbow: false
+    Max Color: 255; 255; 255
+    Min Color: 0; 0; 0
+    Name: Submap
+    Position Transformer: XYZ
+    Selectable: true
+    Size (Pixels): 3
+    Size (m): 0.04
+    Style: Flat Squares
+    Topic:
+      Depth: 5
+      Durability Policy: Volatile
+      Filter size: 10
+      History Policy: Keep Last
+      Reliability Policy: Reliable
+      Value: /submap
+    Use Fixed Frame: true
+    Use rainbow: true
+    Value: true
+  - Alpha: 1
+    Autocompute Intensity Bounds: true
+    Autocompute Value Bounds:
+      Max Value: 3
+      Min Value: -1
+      Value: true
+    Axis: Z
+    Channel Name: intensity
+    Class: rviz_default_plugins/PointCloud2
+    Color: 255; 60; 60
+    Color Transformer: FlatColor
+    Decay Time: 8.0
+    Enabled: true
+    Invert Rainbow: false
+    Max Color: 255; 255; 255
+    Min Color: 0; 0; 0
+    Name: ScanInMap
+    Position Transformer: XYZ
+    Selectable: true
+    Size (Pixels): 5
+    Size (m): 0.06
+    Style: Flat Squares
+    Topic:
+      Depth: 5
+      Durability Policy: Volatile
+      Filter size: 10
+      History Policy: Keep Last
+      Reliability Policy: Reliable
+      Value: /cur_scan_in_map
+    Use Fixed Frame: true
+    Use rainbow: true
+    Value: true
+  - Alpha: 1
+    Autocompute Intensity Bounds: true
+    Autocompute Value Bounds:
+      Max Value: 4
+      Min Value: -1
+      Value: true
+    Axis: Z
+    Channel Name: intensity
+    Class: rviz_default_plugins/PointCloud2
+    Color: 255; 255; 255
+    Color Transformer: AxisColor
+    Decay Time: 999999
+    Enabled: true
+    Invert Rainbow: false
+    Max Color: 255; 255; 255
+    Min Color: 0; 0; 0
+    Name: LiveMap (accumulated)
+    Position Transformer: XYZ
+    Selectable: true
+    Size (Pixels): 3
+    Size (m): 0.02
+    Style: Flat Squares
+    Topic:
+      Depth: 5
+      Durability Policy: Volatile
+      Filter size: 10
+      History Policy: Keep Last
+      Reliability Policy: Reliable
+      Value: /cloud_registered
+    Use Fixed Frame: true
+    Use rainbow: true
+    Value: true
+  - Angle Tolerance: 0.1
+    Class: rviz_default_plugins/Odometry
+    Covariance:
+      Orientation:
+        Alpha: 0.5
+        Color: 255; 255; 127
+        Color Style: Unique
+        Frame: Local
+        Offset: 1
+        Scale: 1
+        Value: true
+      Position:
+        Alpha: 0.3
+        Color: 204; 51; 204
+        Scale: 1
+        Value: true
       Value: false
-
-    # map -> base_footprint from transform_fusion. Backend-agnostic: both
-    # backends feed it, so this display works either way.
-    - Angle Tolerance: 0.1
-      Class: rviz_default_plugins/Odometry
-      Covariance:
-        Orientation:
-          Alpha: 0.5
-          Color: 255; 255; 127
-          Color Style: Unique
-          Frame: Local
-          Offset: 1
-          Scale: 1
-          Value: true
-        Position:
-          Alpha: 0.3
-          Color: 204; 51; 204
-          Scale: 1
-          Value: true
-        Value: false
-      Enabled: true
-      Keep: 1
-      Name: Localization
-      Position Tolerance: 0.1
-      Shape:
-        Alpha: 1
-        Axes Length: 0.6
-        Axes Radius: 0.06
-        Color: 255; 25; 0
-        Head Length: 0.2
-        Head Radius: 0.1
-        Shaft Length: 0.5
-        Shaft Radius: 0.04
-        Value: Axes
-      Topic:
-        Depth: 5
-        Durability Policy: Volatile
-        Filter size: 10
-        History Policy: Keep Last
-        Reliability Policy: Reliable
-        Value: /localization
-      Value: true
-
-    # Needs the sensor rig URDF (pepper_sensor_tf.launch.py publisher:=urdf,
-    # the default), which every localization launch already includes.
-    - Alpha: 1
-      Class: rviz_default_plugins/RobotModel
-      Collision Enabled: false
-      Description File: ""
-      Description Source: Topic
-      Description Topic:
-        Depth: 5
-        Durability Policy: Transient Local
-        History Policy: Keep Last
-        Reliability Policy: Reliable
-        Value: /sensor_rig/robot_description
-      Enabled: true
-      Name: RobotModel
-      Visual Enabled: true
-
-    # z=0 in 'map' is the floor -- the leveled, floor-referenced datum. If this
-    # grid does not sit on the mapped floor, the leveling is wrong, not the ICP.
-    - Alpha: 0.3
-      Cell Size: 1
-      Class: rviz_default_plugins/Grid
-      Color: 160; 160; 164
-      Enabled: true
-      Line Style:
-        Line Width: 0.03
-        Value: Lines
-      Name: Grid
-      Normal Cell Count: 0
-      Offset:
-        X: 0
-        Y: 0
-        Z: 0
-      Plane: XY
-      Plane Cell Count: 40
-      Reference Frame: <Fixed Frame>
-      Value: true
+    Enabled: true
+    Keep: 1
+    Name: Localization
+    Position Tolerance: 0.1
+    Shape:
+      Alpha: 1
+      Axes Length: 0.6
+      Axes Radius: 0.06
+      Color: 255; 25; 0
+      Head Length: 0.2
+      Head Radius: 0.1
+      Shaft Length: 0.5
+      Shaft Radius: 0.04
+      Value: Axes
+    Topic:
+      Depth: 5
+      Durability Policy: Volatile
+      Filter size: 10
+      History Policy: Keep Last
+      Reliability Policy: Reliable
+      Value: /localization
+    Value: true
+  - Alpha: 1
+    Class: rviz_default_plugins/RobotModel
+    Collision Enabled: false
+    Description File: ''
+    Description Source: Topic
+    Description Topic:
+      Depth: 5
+      Durability Policy: Transient Local
+      History Policy: Keep Last
+      Reliability Policy: Reliable
+      Value: /sensor_rig/robot_description
+    Enabled: true
+    Name: RobotModel
+    Visual Enabled: true
+  - Alpha: 0.3
+    Cell Size: 1
+    Class: rviz_default_plugins/Grid
+    Color: 160; 160; 164
+    Enabled: true
+    Line Style:
+      Line Width: 0.03
+      Value: Lines
+    Name: Grid
+    Normal Cell Count: 0
+    Offset:
+      X: 0
+      Y: 0
+      Z: 0
+    Plane: XY
+    Plane Cell Count: 40
+    Reference Frame: <Fixed Frame>
+    Value: true
   Enabled: true
   Global Options:
     Background Color: 48; 48; 48
@@ -269,41 +227,38 @@ Visualization Manager:
     Frame Rate: 30
   Name: root
   Tools:
-    - Class: rviz_default_plugins/Interact
-      Hide Inactive Objects: true
-    - Class: rviz_default_plugins/MoveCamera
-    - Class: rviz_default_plugins/Select
-    - Class: rviz_default_plugins/FocusCamera
-    - Class: rviz_default_plugins/Measure
-      Line color: 128; 128; 0
-    # The ICP seed. global_localization interprets this as the ROBOT's pose in
-    # map (initial_pose_is_base, default true) and composes out the current
-    # odom -> base itself, so click where the robot actually is.
-    - Class: rviz_default_plugins/SetInitialPose
-      Covariance x: 0.25
-      Covariance y: 0.25
-      Covariance yaw: 0.06853891909122467
-      Topic:
-        Depth: 5
-        Durability Policy: Volatile
-        History Policy: Keep Last
-        Reliability Policy: Reliable
-        Value: /initialpose
-    - Class: rviz_default_plugins/SetGoal
-      Topic:
-        Depth: 5
-        Durability Policy: Volatile
-        History Policy: Keep Last
-        Reliability Policy: Reliable
-        Value: /goal_pose
-    - Class: rviz_default_plugins/PublishPoint
-      Single click: true
-      Topic:
-        Depth: 5
-        Durability Policy: Volatile
-        History Policy: Keep Last
-        Reliability Policy: Reliable
-        Value: /clicked_point
+  - Class: rviz_default_plugins/Interact
+    Hide Inactive Objects: true
+  - Class: rviz_default_plugins/MoveCamera
+  - Class: rviz_default_plugins/Select
+  - Class: rviz_default_plugins/FocusCamera
+  - Class: rviz_default_plugins/Measure
+    Line color: 128; 128; 0
+  - Class: rviz_default_plugins/SetInitialPose
+    Covariance x: 0.25
+    Covariance y: 0.25
+    Covariance yaw: 0.06853891909122467
+    Topic:
+      Depth: 5
+      Durability Policy: Volatile
+      History Policy: Keep Last
+      Reliability Policy: Reliable
+      Value: /initialpose
+  - Class: rviz_default_plugins/SetGoal
+    Topic:
+      Depth: 5
+      Durability Policy: Volatile
+      History Policy: Keep Last
+      Reliability Policy: Reliable
+      Value: /goal_pose
+  - Class: rviz_default_plugins/PublishPoint
+    Single click: true
+    Topic:
+      Depth: 5
+      Durability Policy: Volatile
+      History Policy: Keep Last
+      Reliability Policy: Reliable
+      Value: /clicked_point
   Transformation:
     Current:
       Class: rviz_default_plugins/TF
@@ -330,7 +285,7 @@ Visualization Manager:
       Target Frame: <Fixed Frame>
       Value: Orbit (rviz_default_plugins)
       Yaw: 3.14
-    Saved: ~
+    Saved: null
 Window Geometry:
   Displays:
     collapsed: false
