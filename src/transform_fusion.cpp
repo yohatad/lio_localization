@@ -97,16 +97,41 @@ private:
   {
     std::lock_guard<std::mutex> lk(mtx_);
     T_map_to_odom_ = poseToMat(msg->pose.pose);
+    if (!have_correction_) {
+      have_correction_ = true;
+      RCLCPP_INFO(get_logger(),
+                  "First accepted correction received; now broadcasting %s -> %s.",
+                  map_frame_.c_str(), odom_frame_.c_str());
+    }
   }
 
   void transformFusion()
   {
     Eigen::Matrix4f T;
     nav_msgs::msg::Odometry::SharedPtr cur_odom;
+    bool have;
     {
       std::lock_guard<std::mutex> lk(mtx_);
       T = T_map_to_odom_;
       cur_odom = cur_odom_;
+      have = have_correction_;
+    }
+
+    // Publish NOTHING until global_localization has accepted a match.
+    // Broadcasting the identity default would assert map == odom_frame, and
+    // odom_frame is the LIO's own gravity-tilted world frame -- so a failed
+    // localization would look exactly like a working one: complete TF tree,
+    // topics flowing, RViz rendering, and the robot climbing a 90 deg slope
+    // because 'map' inherited the sensor mount's tilt. Absent is honest;
+    // silently wrong is not.
+    if (!have) {
+      auto &clk = *get_clock();
+      RCLCPP_WARN_THROTTLE(get_logger(), clk, 5000,
+          "No accepted correction yet -- not broadcasting %s -> %s. Send an "
+          "initial pose, and lower localization_th if ICP keeps rejecting "
+          "(current scans may only partly overlap the prior map).",
+          map_frame_.c_str(), odom_frame_.c_str());
+      return;
     }
 
     // broadcast map -> odom TF
@@ -152,6 +177,7 @@ private:
 
   std::string map_frame_, odom_frame_, body_frame_;
   Eigen::Matrix4f T_map_to_odom_;
+  bool have_correction_{false};
   nav_msgs::msg::Odometry::SharedPtr cur_odom_;
   std::mutex mtx_;
 
