@@ -209,6 +209,19 @@ private:
       }
     }
     RCLCPP_INFO(get_logger(), "Initial pose received -> global registration...");
+
+    // Publish the seed itself as the first map -> odom correction, BEFORE
+    // attempting registration. transform_fusion withholds the transform until
+    // it sees one, so without this there is no map frame until ICP accepts --
+    // and RViz, whose fixed frame is map, renders nothing and cannot offer the
+    // 2D Pose Estimate tool. Seeding would then require the command line.
+    //
+    // Unlike the identity default this replaced, the seed is a real estimate:
+    // it carries the sensor mount's rotation via the odom -> base lookup above,
+    // and the operator asserted the position. It is refined the moment ICP
+    // accepts a match.
+    publishMapToOdom(init, msg->header.stamp);
+
     {
       std::lock_guard<std::mutex> lk(mtx_);
       if (!cur_scan_) {
