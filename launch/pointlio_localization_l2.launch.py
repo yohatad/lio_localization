@@ -38,7 +38,10 @@ from launch_ros.parameter_descriptions import ParameterValue
 
 # Point-LIO's odometry topic. Both localization nodes hardcode "/Odometry"
 # (FAST-LIO's name), so every Node below remaps it to this.
-POINT_LIO_ODOM_TOPIC = '/aft_mapped_to_init'
+# Point-LIO now remaps its native /aft_mapped_to_init to the shared /odom_lio
+# in mapping_l2lidar_node.launch.py, so localization nodes -- which
+# hardcode "/Odometry" -- are remapped to that instead.
+POINT_LIO_ODOM_TOPIC = '/odom_lio'
 
 
 def _check_map_pcd_exists(context, *args, **kwargs):
