@@ -9,8 +9,14 @@
 # (The installed copy under install/ is only refreshed by colcon build, which is
 # why the source path is the one to use while tuning.)
 #
-# Values here are overridden by any explicit launch argument, so
-# `localization_th:=0.5` on the command line still wins for a one-off test.
+# THIS FILE IS THE ONLY SOURCE for the ICP tunables below. An earlier version
+# of this note claimed `localization_th:=0.5` on the command line would win --
+# it does NOT. fastlio_localization_l2.launch.py deliberately keeps its
+# parameter dict minimal so the YAML is not shadowed (see the comment above the
+# global_localization Node), which means anything absent from that dict cannot
+# be set from the command line at all. localization_th and max_corr_dist were
+# declared as launch arguments but never reached the node; those dead arguments
+# have been removed. Edit them here.
 
 /**:
   ros__parameters:
@@ -70,7 +76,14 @@
     # ICP corrections per second. MEASURED: 2 Hz gives 153 mm median correction
     # steps vs 352 mm at upstream's 0.5 Hz, because less drift accumulates
     # between corrections. Each match costs 25-75 ms, so 2 Hz is ~10% duty.
-    freq_localization: 1.0
+    #
+    # 2026-08-12: 1.0 -> 2.0. The value contradicted the measurement directly
+    # above it. fastlio_localization_l2.launch.py also declared a
+    # freq_localization argument defaulting to 2.0 with the same justification,
+    # but that argument never reached the node, so the effective rate was 1.0
+    # and both the comment and the launch default were describing a setting that
+    # was not in use. That dead argument has been removed.
+    freq_localization: 2.0
 
     # Rate transform_fusion rebroadcasts the latest correction as TF.
     fusion_rate: 50.0

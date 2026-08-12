@@ -39,7 +39,6 @@ def generate_launch_description():
     rviz = LaunchConfiguration('rviz')
     rviz_cfg = LaunchConfiguration('rviz_cfg')
     use_sim_time = LaunchConfiguration('use_sim_time')
-    localization_th = LaunchConfiguration('localization_th')
 
     declare_map_pcd_cmd = DeclareLaunchArgument(
         'map_pcd',
@@ -57,22 +56,14 @@ def generate_launch_description():
     declare_use_sim_time_cmd = DeclareLaunchArgument(
         'use_sim_time', default_value='true',
         description='true for bag replay (--clock); false on the robot.')
-    declare_localization_th_cmd = DeclareLaunchArgument(
-        'localization_th', default_value='0.95',
-        description='Min ICP inlier-ratio fitness to accept a match. 0.90 was '
-                    'upstream\'s value and is too strict for the L2 on this rig: '
-                    'measured 0.793 on bags/July_22, so EVERY match was rejected '
-                    'and no map -> odom_lidar was ever published. At 0.70 the same '
-                    'bag locks at 0.978. Raise it if you see it locking onto the '
-                    'wrong place; lower it further if it never locks at all.')
-    declare_freq_cmd = DeclareLaunchArgument(
-        'freq_localization', default_value='2.0',
-        description='ICP corrections per second. Upstream shipped 0.5 Hz, which '
-                    'leaves the pose frozen for 2 s at a time -- on a moving '
-                    'robot the next ICP then starts from a stale seed. Each '
-                    'match measured 25-75 ms here, so 2 Hz is ~10% duty cycle '
-                    'and 5 Hz is still comfortable. Raise for faster motion, '
-                    'lower if CPU-bound.')
+    # localization_th and max_corr_dist USED TO BE DECLARED HERE. They were dead:
+    # the global_localization Node's parameter dict deliberately stays minimal so
+    # the YAML is not shadowed, and neither name appeared in it, so passing
+    # localization_th:=0.5 on the command line did nothing while looking like it
+    # worked. Both live in config/localization.yaml, which is now the only place
+    # they can be set. They are also strongly coupled -- tightening max_corr_dist
+    # lowers the fitness a GOOD lock scores -- so changing one without the other
+    # is what made every match get rejected; keep them together in one file.
 
     # base_footprint -> l2lidar_frame -> l2lidar_frame_imu (+ cams). The lio bridge
     # needs the static base_footprint -> l2lidar_frame_imu to close odom->base_footprint.
@@ -139,37 +130,14 @@ def generate_launch_description():
         }],
     )
 
-    declare_mapvox_cmd = DeclareLaunchArgument(
-        'map_voxel_size', default_value='0.15',
-        description='Voxel leaf the PRIOR MAP is downsampled to on load. This '
-                    'is the precision floor for the whole stack: ICP cannot '
-                    'localize finer than the map it matches against. Upstream '
-                    'shipped 0.4 m, and measured map->odom corrections sat at '
-                    '150-370 mm -- the same scale. Smaller = finer but more '
-                    'points and slower ICP.')
 
-    declare_corr_cmd = DeclareLaunchArgument(
-        'max_corr_dist', default_value='0.25',
-        description='ICP correspondence radius at the fine scale, and the radius '
-                    'the inlier-ratio fitness is measured over -- deliberately the '
-                    'same number, so fitness means "fraction that actually aligned" '
-                    'rather than "fraction within a metre of anything". Upstream '
-                    'used 1.0 m, which on large flat walls lets the solution slide '
-                    'along the surface while every point keeps a partner: measured '
-                    '423 mm of zero-mean jitter at fitness 0.98. NOTE this couples '
-                    'to localization_th -- tightening the radius lowers fitness, so '
-                    'the two must be tuned together.')
+    # REMOVED as dead: max_corr_dist, freq_localization, map_voxel_size and
+    # fov_far were all declared here but never referenced, so none of them
+    # reached the node. Two of them also disagreed with the YAML that was
+    # actually in force -- this file advertised freq_localization 2.0 and
+    # map_voxel_size 0.15 while the node ran at 1.0 and 0.4. They live in
+    # config/localization.yaml.
 
-    declare_fovfar_cmd = DeclareLaunchArgument(
-        'fov_far', default_value='10.0',
-        description='Radius (m) the prior map is cropped to around the current '
-                    'estimate each cycle -- the SEARCH AREA. ICP only ever sees '
-                    'inside this ball, so a seed further off than this can never '
-                    'recover. Bigger = more tolerant of a bad initial pose, but '
-                    'more map points per ICP and more chance of latching onto a '
-                    'similar-looking region elsewhere. The L2 itself only returns '
-                    'to ~30 m, so beyond that you are adding map with no scan to '
-                    'match it against.')
 
     declare_params_cmd = DeclareLaunchArgument(
         'params_file',
@@ -184,11 +152,6 @@ def generate_launch_description():
     ld.add_action(declare_rviz_cmd)
     ld.add_action(declare_rviz_cfg_cmd)
     ld.add_action(declare_use_sim_time_cmd)
-    ld.add_action(declare_localization_th_cmd)
-    ld.add_action(declare_freq_cmd)
-    ld.add_action(declare_mapvox_cmd)
-    ld.add_action(declare_corr_cmd)
-    ld.add_action(declare_fovfar_cmd)
     ld.add_action(declare_params_cmd)
     ld.add_action(OpaqueFunction(function=_check_map_pcd_exists))
     ld.add_action(sensor_tf_launch)
