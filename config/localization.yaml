@@ -43,7 +43,14 @@
     # is how well the scan and this prior map genuinely agree. Tightening it
     # also made the jitter WORSE (533 mm at 0.5, 1053 mm at 0.75, vs 423 mm at
     # 1.0), so the sliding-along-walls theory did not hold.
-    max_corr_dist: 0.25
+    #
+    # 2026-08-12: 0.25 -> 1.0. At 0.25 a good lock scores 0.53 while
+    # localization_th demanded 0.85, so EVERY match was rejected and the node
+    # published no map frame at all -- the exact failure this block warns about.
+    # The measurements above already favour 1.0 on both axes: best fitness for a
+    # true lock (0.98) and lowest jitter (423 mm). The pair (max_corr_dist,
+    # localization_th) must be chosen together; see the note below.
+    max_corr_dist: 1.0
     icp_iterations: 40
 
     # --- acceptance ---------------------------------------------------------
@@ -51,6 +58,12 @@
     # 0.95 is only reachable with max_corr_dist 1.0 (measured 0.98 there); at
     # any tighter radius a GOOD lock scores 0.53-0.61 and everything is
     # rejected, leaving no map frame at all.
+    #
+    # VALID ONLY WITH max_corr_dist: 1.0, where a true lock measures 0.98 and
+    # 0.85 leaves clear margin. If you tighten max_corr_dist you MUST lower this
+    # in step (roughly 0.45 at 0.25, 0.50 at 0.5) or nothing is ever accepted.
+    # Do not raise it above 0.95: the gap between a true lock and a confident
+    # WRONG lock is what this gate is for, and a false lock is worse than none.
     localization_th: 0.85
 
     # --- rate ---------------------------------------------------------------
