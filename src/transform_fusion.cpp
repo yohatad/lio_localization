@@ -63,6 +63,10 @@ public:
     odom_frame_ = declare_parameter<std::string>("odom_frame", "odom");
     body_frame_ = declare_parameter<std::string>("body_frame", "body");
     double rate = declare_parameter<double>("fusion_rate", 50.0);  // upstream: 50 Hz
+    // REGRESSION FIX 2026-08-12: was hardcoded "/Odometry", which every mapping
+    // launch now remaps onto /odom_lio -- so this had zero publishers and the
+    // node silently never saw odometry. See the same fix in global_localization.
+    odom_topic_ = declare_parameter<std::string>("odom_topic", "/odom_lio");
 
     T_map_to_odom_ = Eigen::Matrix4f::Identity();
     br_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
@@ -70,7 +74,7 @@ public:
 
     auto qos = rclcpp::QoS(1);
     sub_odom_ = create_subscription<nav_msgs::msg::Odometry>(
-      "/Odometry", qos,
+      odom_topic_, qos,
       std::bind(&TransformFusion::cbSaveCurOdom, this, std::placeholders::_1));
     sub_map_to_odom_ = create_subscription<nav_msgs::msg::Odometry>(
       "/map_to_odom", qos,
@@ -175,7 +179,7 @@ private:
     }
   }
 
-  std::string map_frame_, odom_frame_, body_frame_;
+  std::string map_frame_, odom_frame_, body_frame_, odom_topic_;
   Eigen::Matrix4f T_map_to_odom_;
   bool have_correction_{false};
   nav_msgs::msg::Odometry::SharedPtr cur_odom_;

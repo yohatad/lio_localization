@@ -45,6 +45,27 @@ def generate_launch_description():
         default_value='/home/yoha/Lidar/run_l2_lc/pgo_output/map_batch.pcd',
         description='Prior map .pcd to localize against (the loop-closed PGO map).'
     )
+    # Enables SEEDLESS localization. Without it the node can only start from a
+    # manual /initialpose, because its ICP is purely local: the coarse pass
+    # captures ~max_corr_dist * 5 and cropMapInFov crops the prior to fov_far
+    # around the guess, so a seed more than a few metres out can never recover.
+    # These are the keyframe poses PGO writes beside map_batch.pcd -- places the
+    # robot has actually been, which is a far better hypothesis set than a blind
+    # grid over free space. Also what /relocalize searches.
+    declare_kf_poses_cmd = DeclareLaunchArgument(
+        'keyframe_poses',
+        default_value='/home/yoha/Lidar/run_l2_lc/pgo_output/optimized_poses.txt',
+        description='KITTI-format keyframe poses from the mapping run, used as '
+                    'candidates for global localization and /relocalize. Empty '
+                    'disables both (manual /initialpose only). Must come from '
+                    'the SAME run as map_pcd.'
+    )
+    declare_auto_init_cmd = DeclareLaunchArgument(
+        'auto_initialize', default_value='false',
+        description='Run the global search automatically at startup instead of '
+                    'waiting for /initialpose or /relocalize. Off by default: a '
+                    'silent lock onto the wrong place is worse than waiting.'
+    )
     declare_rviz_cmd = DeclareLaunchArgument('rviz', default_value='true')
     declare_rviz_cfg_cmd = DeclareLaunchArgument(
         'rviz_cfg',
@@ -105,6 +126,9 @@ def generate_launch_description():
         parameters=[LaunchConfiguration('params_file'), {
             'use_sim_time': use_sim_time,
             'map_pcd': map_pcd,
+            'keyframe_poses': LaunchConfiguration('keyframe_poses'),
+            'auto_initialize': ParameterValue(
+                LaunchConfiguration('auto_initialize'), value_type=bool),
             'map_frame': 'map',
             'odom_frame': 'odom_lidar',
             'scan_voxel_size': 0.1,
@@ -149,6 +173,8 @@ def generate_launch_description():
 
     ld = LaunchDescription()
     ld.add_action(declare_map_pcd_cmd)
+    ld.add_action(declare_kf_poses_cmd)
+    ld.add_action(declare_auto_init_cmd)
     ld.add_action(declare_rviz_cmd)
     ld.add_action(declare_rviz_cfg_cmd)
     ld.add_action(declare_use_sim_time_cmd)

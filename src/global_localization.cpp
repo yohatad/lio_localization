@@ -27,6 +27,10 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <algorithm>
+#include <fstream>
+#include <vector>
+#include <std_srvs/srv/trigger.hpp>
 
 #include <Eigen/Dense>
 
@@ -125,6 +129,24 @@ public:
     FOV_ = declare_parameter<double>("fov", 6.28);        // >pi -> ring lidar
     FOV_FAR_ = declare_parameter<double>("fov_far", 30.0);
 
+    // --- seedless (global) localization ---
+    // Empty disables it: the node then behaves exactly as before, requiring a
+    // manual /initialpose. Point it at the optimized_poses.txt that
+    // fastlio_lc_pgo writes next to map_batch.pcd.
+    cloud_topic_ = declare_parameter<std::string>("cloud_topic", "/cloud_registered");
+    odom_topic_ = declare_parameter<std::string>("odom_topic", "/odom_lio");
+
+    kf_poses_path_ = declare_parameter<std::string>("keyframe_poses", "");
+    GLOBAL_SPACING_ = declare_parameter<double>("global_candidate_spacing", 3.0);
+    GLOBAL_YAW_BINS_ = declare_parameter<int>("global_yaw_bins", 12);
+    GLOBAL_TOP_K_ = declare_parameter<int>("global_top_k", 5);
+    GLOBAL_COARSE_ITERS_ = declare_parameter<int>("global_coarse_iterations", 6);
+    GLOBAL_COARSE_SCALE_ = declare_parameter<double>("global_coarse_scale", 5.0);
+    // Off by default: a search that locks onto the wrong place silently is
+    // worse than one that waits to be asked. Turn on for unattended bringup,
+    // once you trust the acceptance gate on your map.
+    AUTO_INIT_ = declare_parameter<bool>("auto_initialize", false);
+
     global_map_.reset(new Cloud);
     if (map_pcd_.empty()) {
       throw std::runtime_error("param 'map_pcd' (prior map .pcd path) is required");
@@ -145,25 +167,89 @@ public:
     pub_scan_in_map_ = create_publisher<sensor_msgs::msg::PointCloud2>("/cur_scan_in_map", 1);
 
     auto qos = rclcpp::QoS(1);
+    // REGRESSION FIX 2026-08-12: the odometry topic was hardcoded "/Odometry".
+    // Every mapping launch in this workspace now remaps FAST-LIO's odometry
+    // onto /odom_lio (the shared name across FAST-LIO, Point-LIO, FAST-LIVO2
+    // and RTAB-Map), so "/Odometry" ended up with ZERO publishers and two
+    // subscribers. cbOdom never fired, cur_odom_ stayed null, and
+    // globalLocalization()'s first guard returned false -- which made even a
+    // CORRECT manual /initialpose report "Initial registration failed", with
+    // nothing in the log pointing at the real cause. Parameterised so the next
+    // rename is a config change, not a silent breakage.
     sub_scan_ = create_subscription<sensor_msgs::msg::PointCloud2>(
-      "/cloud_registered", qos,
+      cloud_topic_, qos,
       std::bind(&GlobalLocalization::cbScan, this, std::placeholders::_1));
     sub_odom_ = create_subscription<nav_msgs::msg::Odometry>(
-      "/Odometry", qos,
+      odom_topic_, qos,
       std::bind(&GlobalLocalization::cbOdom, this, std::placeholders::_1));
+    RCLCPP_INFO(get_logger(), "Subscribing: cloud '%s', odom '%s'.",
+                cloud_topic_.c_str(), odom_topic_.c_str());
     sub_init_ = create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
       "/initialpose", 1,
       std::bind(&GlobalLocalization::cbInitialPose, this, std::placeholders::_1));
 
+    // Candidate places for a seedless search: where the robot has actually
+    // been, straight out of the mapping run.
+    if (!kf_poses_path_.empty()) {
+      kf_poses_ = loadKeyframePoses(kf_poses_path_);
+      kf_cands_ = thinCandidates(kf_poses_, GLOBAL_SPACING_);
+      if (kf_poses_.empty()) {
+        RCLCPP_WARN(get_logger(),
+          "keyframe_poses '%s' could not be read; global localization and "
+          "/relocalize will be unavailable and an /initialpose will be required.",
+          kf_poses_path_.c_str());
+      } else {
+        RCLCPP_INFO(get_logger(),
+          "Global localization armed: %zu keyframe poses -> %zu candidates at "
+          ">=%.1f m spacing, x %d yaw bins = %zu hypotheses.",
+          kf_poses_.size(), kf_cands_.size(), GLOBAL_SPACING_,
+          GLOBAL_YAW_BINS_, kf_cands_.size() * size_t(GLOBAL_YAW_BINS_));
+      }
+    }
+
+    // Also the kidnapped-robot recovery: initialized_ was set once in
+    // cbInitialPose and never reset, so there was no way to ask for a new fix.
+    srv_relocalize_ = create_service<std_srvs::srv::Trigger>(
+      "/relocalize",
+      [this](const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+             std::shared_ptr<std_srvs::srv::Trigger::Response> res) {
+        if (kf_poses_.empty()) {
+          res->success = false;
+          res->message = "No keyframe_poses loaded; set the parameter to the "
+                         "optimized_poses.txt beside map_batch.pcd.";
+          return;
+        }
+        initialized_ = false;   // stop steady-state tracking off a stale fix
+        startGlobalSearch();
+        res->success = true;
+        res->message = "Global search started in the background; watch the log.";
+      });
+
     T_map_to_odom_ = Eigen::Matrix4f::Identity();
     running_ = true;
     loc_thread_ = std::thread(&GlobalLocalization::locLoop, this);
+
+    if (AUTO_INIT_ && !kf_poses_.empty()) {
+      // Deferred: a scan and an odom sample must arrive first, and the search
+      // itself needs the node spinning to log progress.
+      auto_init_timer_ = create_wall_timer(std::chrono::seconds(2), [this]() {
+        if (initialized_ || search_running_) return;
+        {
+          std::lock_guard<std::mutex> lk(mtx_);
+          if (!cur_scan_ || !cur_odom_) return;   // wait for data
+        }
+        auto_init_timer_->cancel();
+        RCLCPP_INFO(get_logger(), "auto_initialize: starting global search.");
+        startGlobalSearch();
+      });
+    }
   }
 
   ~GlobalLocalization() override
   {
     running_ = false;
     if (loc_thread_.joinable()) loc_thread_.join();
+    if (search_thread_.joinable()) search_thread_.join();
   }
 
 private:
@@ -260,7 +346,7 @@ private:
   // Coarse->fine multi-scale ICP (upstream registration_at_scale).
   Eigen::Matrix4f registrationAtScale(const Cloud::Ptr &scan, const Cloud::Ptr &map,
                                       const Eigen::Matrix4f &guess, double scale,
-                                      double &fitness_out)
+                                      double &fitness_out, int iters = -1)
   {
     Cloud::Ptr scan_ds(new Cloud), map_ds(new Cloud);
     voxel(scan, scan_ds, SCAN_VOXEL_ * scale);
@@ -276,7 +362,11 @@ private:
     // of zero-mean jitter in map->odom (net/sum ratio 0.09, i.e. 91% of the
     // motion cancelled out) at fitness 0.98. Tightening it penalises sliding.
     icp.setMaxCorrespondenceDistance(MAX_CORR_DIST_ * scale);
-    icp.setMaximumIterations(ICP_ITERS_);
+    // iters < 0 means "use the configured count". The global search overrides it
+    // with a much smaller number: that pass only RANKS hypotheses, and running
+    // 40 iterations on each of several hundred is what would make a seedless
+    // search take minutes instead of seconds.
+    icp.setMaximumIterations(iters > 0 ? iters : ICP_ITERS_);
 
     Cloud aligned;
     icp.align(aligned, guess);
@@ -336,10 +426,15 @@ private:
     pub_map_to_odom_->publish(msg);
   }
 
-  bool globalLocalization(const Eigen::Matrix4f &pose_estimation)
+  // from_search: the caller already holds reg_mtx_ (globalSearch does), and the
+  // failure log should stay quiet because trying many hypotheses and rejecting
+  // most of them is the normal path there, not a problem.
+  bool globalLocalization(const Eigen::Matrix4f &pose_estimation,
+                          bool from_search = false)
   {
     // serialize registrations (initialpose callback vs background loop)
-    std::lock_guard<std::mutex> reg_lk(reg_mtx_);
+    std::unique_lock<std::mutex> reg_lk(reg_mtx_, std::defer_lock);
+    if (!from_search) reg_lk.lock();
 
     Cloud::Ptr scan;
     nav_msgs::msg::Odometry odom;
@@ -373,7 +468,8 @@ private:
       RCLCPP_INFO(get_logger(), "matched (fitness %.3f, %.0f ms)", fitness, dt_ms);
       return true;
     }
-    RCLCPP_WARN(get_logger(), "no match (fitness %.3f < %.2f)", fitness, LOCALIZATION_TH_);
+    if (!from_search)
+      RCLCPP_WARN(get_logger(), "no match (fitness %.3f < %.2f)", fitness, LOCALIZATION_TH_);
     return false;
   }
 
@@ -392,8 +488,180 @@ private:
     }
   }
 
+  // ---- global (seedless) localization -----------------------------------
+  //
+  // The rest of this node is LOCAL: registrationAtScale's capture radius is
+  // max_corr_dist * scale, and cropMapInFov crops the prior to fov_far around
+  // the guess, so a seed more than ~1 m and a few degrees off can never
+  // recover. Without the block below the node needs a human to publish
+  // /initialpose before it will ever produce a map frame, and initialized_ is
+  // never reset, so there is no kidnapped-robot recovery either.
+  //
+  // Approach: the mapping run already writes optimized_poses.txt (KITTI 3x4
+  // per line) next to map_batch.pcd. Those keyframe poses are, by construction,
+  // places the robot has actually been -- a far better candidate set than a
+  // blind grid over free space. Sweep them x yaw bins, score each cheaply,
+  // then verify the best few with the same two-stage registration and the same
+  // acceptance gate used in steady state. No new dependency, no new file
+  // format, and it reuses machinery that is already tuned.
+  //
+  // Scan Context would let us propose ~10 candidates instead of sweeping, but
+  // its descriptor DB is never saved by the PGO node (saveScancontextAndKeys is
+  // called nowhere), and its known weakness is self-similar geometry -- which a
+  // repetitive indoor office is. It belongs here later as an ACCELERATOR, not
+  // as the decider.
+  std::vector<Eigen::Matrix4f> loadKeyframePoses(const std::string &path)
+  {
+    std::vector<Eigen::Matrix4f> out;
+    std::ifstream f(path);
+    if (!f.is_open()) return out;
+    double v[12];
+    while (f >> v[0] >> v[1] >> v[2] >> v[3] >> v[4] >> v[5]
+             >> v[6] >> v[7] >> v[8] >> v[9] >> v[10] >> v[11]) {
+      Eigen::Matrix4f m = Eigen::Matrix4f::Identity();
+      for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 4; ++c) m(r, c) = float(v[r * 4 + c]);
+      out.push_back(m);
+    }
+    return out;
+  }
+
+  // Thin the candidate list so entries are at least `spacing` apart. A 165 m
+  // indoor run yields ~1100 keyframes; at 12 yaw bins that would be >13000
+  // registrations. Keyframes also cluster wherever the robot paused or turned,
+  // which adds candidates without adding coverage.
+  std::vector<Eigen::Matrix4f> thinCandidates(const std::vector<Eigen::Matrix4f> &in,
+                                              double spacing) const
+  {
+    std::vector<Eigen::Matrix4f> out;
+    for (const auto &m : in) {
+      bool far = true;
+      for (const auto &k : out) {
+        if ((m.block<3, 1>(0, 3) - k.block<3, 1>(0, 3)).norm() < spacing) { far = false; break; }
+      }
+      if (far) out.push_back(m);
+    }
+    return out;
+  }
+
+  // Returns map->odom on success. Runs on its own thread; can take seconds.
+  bool globalSearch()
+  {
+    std::lock_guard<std::mutex> reg_lk(reg_mtx_);
+
+    if (kf_poses_.empty()) {
+      RCLCPP_ERROR(get_logger(),
+        "Global localization needs keyframe poses, but '%s' held none. It is "
+        "written by fastlio_lc_pgo next to map_batch.pcd; set keyframe_poses "
+        "to that file, or send /initialpose manually.", kf_poses_path_.c_str());
+      return false;
+    }
+
+    Cloud::Ptr scan;
+    nav_msgs::msg::Odometry odom;
+    {
+      std::lock_guard<std::mutex> lk(mtx_);
+      if (!cur_scan_ || !cur_odom_) {
+        RCLCPP_WARN(get_logger(), "No scan/odom yet; cannot search.");
+        return false;
+      }
+      scan.reset(new Cloud(*cur_scan_));
+      odom = *cur_odom_;
+    }
+
+    // The scan arrives in the odom frame. A candidate keyframe pose is where
+    // the BASE was in map, so the map->odom guess that would put the robot
+    // there is  T_map_odom = T_map_base * T_odom_base^-1.
+    const Eigen::Matrix4f T_odom_base = poseToMat(odom.pose.pose);
+    const Eigen::Matrix4f T_odom_base_inv = T_odom_base.inverse();
+
+    Cloud::Ptr scan_coarse(new Cloud);
+    voxel(scan, scan_coarse, std::max(SCAN_VOXEL_ * 4.0, 0.4));
+
+    const auto t0 = now();
+    struct Cand { double score; Eigen::Matrix4f T; };
+    std::vector<Cand> scored;
+    const int bins = std::max(1, GLOBAL_YAW_BINS_);
+    int tried = 0;
+
+    for (const auto &kf : kf_cands_) {
+      for (int b = 0; b < bins; ++b) {
+        const double yaw = 2.0 * M_PI * double(b) / double(bins);
+        Eigen::Matrix4f R = Eigen::Matrix4f::Identity();
+        R(0, 0) = float(std::cos(yaw)); R(0, 1) = float(-std::sin(yaw));
+        R(1, 0) = float(std::sin(yaw)); R(1, 1) = float(std::cos(yaw));
+        // rotate about the candidate's own origin
+        Eigen::Matrix4f T_map_base = kf;
+        T_map_base.block<3, 3>(0, 0) = (R.block<3, 3>(0, 0) * kf.block<3, 3>(0, 0)).eval();
+        const Eigen::Matrix4f guess = T_map_base * T_odom_base_inv;
+
+        Cloud::Ptr fov = cropMapInFov(guess, odom.pose.pose);
+        if (fov->size() < 100) continue;
+        double f = 0.0;
+        // Cheap pass: heavily downsampled scan, few iterations. Only ranking.
+        registrationAtScale(scan_coarse, fov, guess, GLOBAL_COARSE_SCALE_, f,
+                            GLOBAL_COARSE_ITERS_);
+        scored.push_back({f, guess});
+        ++tried;
+        if (!running_) return false;
+      }
+    }
+    if (scored.empty()) {
+      RCLCPP_ERROR(get_logger(), "Global search produced no candidates.");
+      return false;
+    }
+
+    std::sort(scored.begin(), scored.end(),
+              [](const Cand &a, const Cand &b) { return a.score > b.score; });
+    const int keep = std::min<int>(GLOBAL_TOP_K_, int(scored.size()));
+    RCLCPP_INFO(get_logger(),
+      "Global search: %d hypotheses over %zu places x %d yaw bins in %.1f s; "
+      "best coarse score %.3f, verifying top %d.",
+      tried, kf_cands_.size(), bins, (now() - t0).seconds(), scored[0].score, keep);
+
+    // Verify the survivors with the SAME two-stage registration and the SAME
+    // gate used in steady state -- a confident wrong lock is worse than none.
+    for (int i = 0; i < keep; ++i) {
+      if (!running_) return false;
+      if (globalLocalization(scored[i].T, /*from_search=*/true)) {
+        RCLCPP_INFO(get_logger(),
+          "Global localization SUCCEEDED on hypothesis %d/%d.", i + 1, keep);
+        return true;
+      }
+    }
+    RCLCPP_WARN(get_logger(),
+      "Global localization FAILED: no hypothesis passed localization_th (%.2f). "
+      "The robot may be somewhere the prior map does not cover, or the map is "
+      "stale. Send /initialpose, or call /relocalize again after moving.",
+      LOCALIZATION_TH_);
+    return false;
+  }
+
+  void startGlobalSearch()
+  {
+    if (search_running_.exchange(true)) {
+      RCLCPP_WARN(get_logger(), "A global search is already running.");
+      return;
+    }
+    if (search_thread_.joinable()) search_thread_.join();
+    search_thread_ = std::thread([this]() {
+      const bool ok = globalSearch();
+      if (ok) initialized_ = true;
+      search_running_ = false;
+    });
+  }
+
   // params
   std::string map_pcd_, map_frame_, odom_frame_, base_frame_;
+  std::string kf_poses_path_, cloud_topic_, odom_topic_;
+  std::vector<Eigen::Matrix4f> kf_poses_, kf_cands_;
+  int GLOBAL_YAW_BINS_{12}, GLOBAL_TOP_K_{5}, GLOBAL_COARSE_ITERS_{6};
+  double GLOBAL_COARSE_SCALE_{5.0}, GLOBAL_SPACING_{3.0};
+  bool AUTO_INIT_{false};
+  std::atomic<bool> search_running_{false};
+  std::thread search_thread_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr srv_relocalize_;
+  rclcpp::TimerBase::SharedPtr auto_init_timer_;
   bool initial_pose_is_base_{true};
   std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
   std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
