@@ -129,6 +129,12 @@ public:
     FOV_ = declare_parameter<double>("fov", 6.28);        // >pi -> ring lidar
     FOV_FAR_ = declare_parameter<double>("fov_far", 30.0);
 
+    // Pose-uncertainty envelope reported on /map_to_odom (see poseSigmas).
+    SIGMA_XY_MIN_ = declare_parameter<double>("pose_sigma_xy_min", 0.03);
+    SIGMA_XY_MAX_ = declare_parameter<double>("pose_sigma_xy_max", 0.30);
+    SIGMA_YAW_MIN_ = declare_parameter<double>("pose_sigma_yaw_min", 0.01);
+    SIGMA_YAW_MAX_ = declare_parameter<double>("pose_sigma_yaw_max", 0.10);
+
     // --- seedless (global) localization ---
     // Empty disables it: the node then behaves exactly as before, requiring a
     // manual /initialpose. Point it at the optimized_poses.txt that
@@ -308,7 +314,7 @@ private:
     // it carries the sensor mount's rotation via the odom -> base lookup above,
     // and the operator asserted the position. It is refined the moment ICP
     // accepts a match.
-    publishMapToOdom(init, msg->header.stamp);
+    publishMapToOdom(init, msg->header.stamp, -1.0);   // seed: no ICP support yet
 
     {
       std::lock_guard<std::mutex> lk(mtx_);
@@ -416,13 +422,50 @@ private:
     pub->publish(msg);
   }
 
-  void publishMapToOdom(const Eigen::Matrix4f &T, const rclcpp::Time &stamp)
+  // Turn an ICP fitness into a pose covariance. fitness is the inlier ratio,
+  // and it is only ever published above LOCALIZATION_TH_, so the useful range
+  // is [th, 1]: rescale that to [0, 1] and interpolate between the configured
+  // sigma bounds. A barely-accepted match reports the loose bound, a near
+  // perfect one the tight bound. fitness < 0 means "no ICP behind this" -- the
+  // /initialpose seed -- which gets the loose bound outright.
+  //
+  // This is a monotone confidence proxy, not a propagated covariance: the
+  // inlier ratio says how much of the scan agrees with the map, not how that
+  // disagreement distributes over x/y/yaw. Treat the numbers as ordering
+  // information for a consumer, not as metrology.
+  void poseSigmas(double fitness, double &sigma_xy, double &sigma_yaw) const
+  {
+    double q = 0.0;
+    if (fitness >= 0.0) {
+      const double span = std::max(1e-6, 1.0 - LOCALIZATION_TH_);
+      q = std::clamp((fitness - LOCALIZATION_TH_) / span, 0.0, 1.0);
+    }
+    sigma_xy = SIGMA_XY_MAX_ + (SIGMA_XY_MIN_ - SIGMA_XY_MAX_) * q;
+    sigma_yaw = SIGMA_YAW_MAX_ + (SIGMA_YAW_MIN_ - SIGMA_YAW_MAX_) * q;
+  }
+
+  // fitness < 0 => seed pose with no ICP support (see poseSigmas).
+  void publishMapToOdom(const Eigen::Matrix4f &T, const rclcpp::Time &stamp,
+                        double fitness)
   {
     nav_msgs::msg::Odometry msg;
     msg.header.stamp = stamp;
     msg.header.frame_id = map_frame_;
     msg.child_frame_id = odom_frame_;
     msg.pose.pose = matToPose(T);
+
+    // Row-major 6x6 over [x y z roll pitch yaw]; diagonal only. Leaving this
+    // at zero (as upstream does) claims a perfect correction, which is what
+    // transform_fusion used to forward onto the fused pose.
+    double sigma_xy = 0.0, sigma_yaw = 0.0;
+    poseSigmas(fitness, sigma_xy, sigma_yaw);
+    msg.pose.covariance[0] = sigma_xy * sigma_xy;    // x
+    msg.pose.covariance[7] = sigma_xy * sigma_xy;    // y
+    msg.pose.covariance[14] = sigma_xy * sigma_xy;   // z
+    msg.pose.covariance[21] = sigma_yaw * sigma_yaw; // roll
+    msg.pose.covariance[28] = sigma_yaw * sigma_yaw; // pitch
+    msg.pose.covariance[35] = sigma_yaw * sigma_yaw; // yaw
+
     pub_map_to_odom_->publish(msg);
   }
 
@@ -464,7 +507,7 @@ private:
         std::lock_guard<std::mutex> lk(mtx_);
         T_map_to_odom_ = transf;
       }
-      publishMapToOdom(transf, odom.header.stamp);
+      publishMapToOdom(transf, odom.header.stamp, fitness);
       RCLCPP_INFO(get_logger(), "matched (fitness %.3f, %.0f ms)", fitness, dt_ms);
       return true;
     }
@@ -667,6 +710,7 @@ private:
   std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
   double MAP_VOXEL_, SCAN_VOXEL_, FREQ_, LOCALIZATION_TH_, FOV_, FOV_FAR_;
   double MAX_CORR_DIST_{0.25};
+  double SIGMA_XY_MIN_, SIGMA_XY_MAX_, SIGMA_YAW_MIN_, SIGMA_YAW_MAX_;
   int ICP_ITERS_{40};
 
   // state

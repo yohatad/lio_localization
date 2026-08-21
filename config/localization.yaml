@@ -88,6 +88,29 @@
     # Rate transform_fusion rebroadcasts the latest correction as TF.
     fusion_rate: 50.0
 
+    # --- reported uncertainty -----------------------------------------------
+    # The pose covariance stamped on /map_to_odom, and forwarded by
+    # transform_fusion onto /localization/pose. Interpolated between these
+    # bounds by ICP fitness, rescaled over [localization_th, 1.0]: a
+    # barely-accepted match reports the _max, a near-perfect one the _min. The
+    # /initialpose seed reports the _max outright, having no ICP behind it.
+    #
+    # These are a monotone confidence proxy, NOT a propagated covariance --
+    # inlier ratio says how much of the scan agrees with the map, not how the
+    # disagreement distributes over x/y/yaw. Nor does either bound model the
+    # LIO drift accumulated between corrections (freq_localization, 2 Hz), so
+    # the true uncertainty mid-interval is somewhat larger than reported.
+    # Size them against the measured correction jitter above (~423 mm at the
+    # current map_voxel_size) rather than trusting the defaults.
+    #
+    # Zero is NOT a safe default here, which is why these exist: an all-zero
+    # covariance asserts a perfect pose, and a downstream EKF reading that will
+    # either discard every other sensor or fail on a singular matrix.
+    pose_sigma_xy_min: 0.03      # metres, 1-sigma, at fitness 1.0
+    pose_sigma_xy_max: 0.30      # metres, 1-sigma, at fitness == localization_th
+    pose_sigma_yaw_min: 0.01     # radians, 1-sigma, at fitness 1.0
+    pose_sigma_yaw_max: 0.10     # radians, 1-sigma, at fitness == localization_th
+
     # --- seeding ------------------------------------------------------------
     # Treat /initialpose as the ROBOT's pose in map (what RViz publishes) and
     # compose out odom->base internally, rather than assuming it is already a
