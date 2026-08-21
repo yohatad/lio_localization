@@ -39,7 +39,7 @@ well, which is why both launches default to the same `.pcd`.
 | Node | Does |
 |------|------|
 | `global_localization` | Loads the prior `.pcd`, PCL-ICP-matches `/cloud_registered` to it, publishes `/map_to_odom` (`nav_msgs/Odometry`, frame `map`). C++. |
-| `transform_fusion` | Rebroadcasts the latest `map→odom_lidar` as **TF at 50 Hz** so lookups stay fresh between ICP updates; also republishes fused pose on `/localization`. C++. |
+| `transform_fusion` | Rebroadcasts the latest `map→odom_lidar` as **TF at 50 Hz** so lookups stay fresh between ICP updates; also republishes fused pose on `/localization/pose`, applying the `<LIO body>→base_footprint` extrinsic to the pose and twist. C++. |
 
 ## 1. Build (no runtime pip deps)
 
@@ -112,7 +112,13 @@ is built for exactly this — Fixed Frame `map`, with:
 - `/cur_scan_in_map` (rainbow) — the live scan through the current estimate.
   **Their overlap is the localization quality**; no metric needed, a bad lock is
   visible.
-- `/localization` — fused `map → base_footprint` pose.
+- `/localization/pose` — fused `map → base_footprint` pose. Genuinely
+  `base_footprint`: the `<LIO body> → base_footprint` extrinsic is looked up
+  from TF once and applied, and the twist is rotated into `base_footprint`
+  with its lever-arm term. Withheld (with a throttled warning) until that
+  lookup succeeds — the `map → odom_lidar` TF is unaffected. Pose covariance
+  carries the ICP fitness via `pose_sigma_*` in `config/localization.yaml`; it
+  does not model LIO drift between corrections.
 
 Fixed Frame is `map`, not `odom`: the correction lives in `map → odom_lidar`, so
 viewed from `odom` each ICP update lurches the *world* around a stationary
