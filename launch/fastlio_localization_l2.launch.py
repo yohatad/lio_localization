@@ -1,6 +1,7 @@
 import os
 
-from ament_index_python.packages import get_package_share_directory
+from ament_index_python.packages import (
+    PackageNotFoundError, get_package_share_directory)
 
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction
@@ -33,6 +34,21 @@ def _check_map_pcd_exists(context, *args, **kwargs):
 def generate_launch_description():
     fast_lio_share = get_package_share_directory('fast_lio')
     sensor_tf_share = get_package_share_directory('pepper_slam')
+    # Map artifacts ship with pepper_navigation so map_pcd and keyframe_poses
+    # resolve on ANY machine (the Jetson runs as a different user, so an
+    # absolute /home/<user> default silently does not exist there).
+    #
+    # Deliberately NOT declared as an exec_depend in package.xml: pepper_navigation
+    # already depends on THIS package, so declaring the reverse edge makes colcon
+    # refuse the whole workspace with "Unable to order packages topologically".
+    # The ament index lookup does not need the declaration -- it only needs the
+    # package to be built. Tolerate its absence so this package still launches
+    # standalone; the defaults are then unusable placeholders, and callers
+    # (pepper_nav2_fastlio_loc.launch.py) pass both paths explicitly anyway.
+    try:
+        nav_share = get_package_share_directory('pepper_navigation')
+    except PackageNotFoundError:
+        nav_share = ''
     localization_share = get_package_share_directory('lio_localization')
 
     map_pcd = LaunchConfiguration('map_pcd')
@@ -42,7 +58,7 @@ def generate_launch_description():
 
     declare_map_pcd_cmd = DeclareLaunchArgument(
         'map_pcd',
-        default_value='/home/yoha/Lidar/run_l2_lc/pgo_output/map_batch.pcd',
+        default_value=os.path.join(nav_share, 'map', 'pepper_map_lc.pcd'),
         description='Prior map .pcd to localize against (the loop-closed PGO map).'
     )
     # Enables SEEDLESS localization. Without it the node can only start from a
@@ -54,7 +70,7 @@ def generate_launch_description():
     # grid over free space. Also what /relocalize searches.
     declare_kf_poses_cmd = DeclareLaunchArgument(
         'keyframe_poses',
-        default_value='/home/yoha/Lidar/run_l2_lc/pgo_output/optimized_poses.txt',
+        default_value=os.path.join(nav_share, 'map', 'pepper_map_lc_poses.txt'),
         description='KITTI-format keyframe poses from the mapping run, used as '
                     'candidates for global localization and /relocalize. Empty '
                     'disables both (manual /initialpose only). Must come from '
