@@ -93,6 +93,17 @@ def generate_launch_description():
     declare_use_sim_time_cmd = DeclareLaunchArgument(
         'use_sim_time', default_value='true',
         description='true for bag replay (--clock); false on the robot.')
+    declare_config_file_cmd = DeclareLaunchArgument(
+        'config_file', default_value='l2_rsimu.yaml',
+        description='FAST-LIO config. l2_rsimu.yaml drives the estimator from '
+                    'the RealSense IMU (/camera/imu, recommended and what the '
+                    'prior map was built with); l2.yaml uses the L2 s own '
+                    '(/imu/data). Change lidar_imu_frame to match.')
+    declare_lidar_imu_frame_cmd = DeclareLaunchArgument(
+        'lidar_imu_frame', default_value='camera_imu_optical_frame',
+        description='Static frame the estimated body corresponds to. '
+                    'camera_imu_optical_frame for l2_rsimu.yaml, '
+                    'l2lidar_frame_imu for l2.yaml.')
     # localization_th and max_corr_dist USED TO BE DECLARED HERE. They were dead:
     # the global_localization Node's parameter dict deliberately stays minimal so
     # the YAML is not shadowed, and neither name appeared in it, so passing
@@ -112,11 +123,24 @@ def generate_launch_description():
     # FAST-LIO odometry ONLY (no PGO). Publishes /Odometry + /cloud_registered
     # in the 'odom_lidar' frame; lio_map_odom_bridge closes
     # odom_lidar -> base_footprint.
+    #
+    # 2026-08-22: config_file was HARDCODED to l2.yaml, i.e. the L2's own IMU,
+    # while the map this localizes against was built with l2_rsimu.yaml and
+    # every bag_test launch already defaulted to the RealSense. The L2 gyro
+    # cancels rotation about the gravity axis below ~16 deg/s and cost 139 deg
+    # of heading over a 744 s run (utils/L2_IMU/REPORT.md) -- and a turn is
+    # exactly when it drops out AND when scan overlap is worst, so it is the
+    # worst possible moment to be dead-reckoning between 0.5 Hz ICP fixes.
+    # Now an argument, defaulting to the RealSense like everything else.
     fast_lio_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(fast_lio_share, 'launch', 'mapping.launch.py')),
         launch_arguments={
-            'config_file': 'l2.yaml',
+            'config_file': LaunchConfiguration('config_file'),
+            # MUST match the IMU the config selects, or lio_map_odom_bridge
+            # closes odom -> base_footprint through the wrong static frame and
+            # the pose comes out rotated with no error anywhere.
+            'lidar_imu_frame': LaunchConfiguration('lidar_imu_frame'),
             'rviz': rviz,
             'rviz_cfg': rviz_cfg,
             'use_sim_time': use_sim_time,
@@ -194,6 +218,8 @@ def generate_launch_description():
     ld.add_action(declare_rviz_cmd)
     ld.add_action(declare_rviz_cfg_cmd)
     ld.add_action(declare_use_sim_time_cmd)
+    ld.add_action(declare_config_file_cmd)
+    ld.add_action(declare_lidar_imu_frame_cmd)
     ld.add_action(declare_params_cmd)
     ld.add_action(OpaqueFunction(function=_check_map_pcd_exists))
     ld.add_action(sensor_tf_launch)
