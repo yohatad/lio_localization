@@ -47,12 +47,17 @@
 #include <pcl/io/pcd_io.h>
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/registration/icp.h>
+#include <pcl/registration/transformation_estimation_point_to_plane_lls.h>
+#include <pcl/features/normal_3d_omp.h>
 #include <pcl/kdtree/kdtree_flann.h>
 #include <pcl/common/transforms.h>
 #include <pcl_conversions/pcl_conversions.h>
 
 using PointT = pcl::PointXYZ;
 using Cloud = pcl::PointCloud<PointT>;
+// Point-to-plane needs a normal on the TARGET, which PointXYZ cannot carry.
+using PointN = pcl::PointNormal;
+using CloudN = pcl::PointCloud<PointN>;
 
 namespace {
 
@@ -130,6 +135,11 @@ public:
     // until the robot has moved this far in the odom frame since the last one.
     // 0.0 for either disables the gate on that axis; 0.0 for both restores
     // purely time-based correction.
+    // Point-to-plane ICP instead of point-to-point. OFF by default: the
+    // 153 mm-scatter baseline everything else is tuned against was measured
+    // with point-to-point, so this must be A/B'd before it becomes the default.
+    POINT_TO_PLANE_ = declare_parameter<bool>("point_to_plane", false);
+    NORMAL_K_ = declare_parameter<int>("normal_k", 10);
     UPDATE_MIN_D_ = declare_parameter<double>("update_min_d", 0.25);
     UPDATE_MIN_A_ = declare_parameter<double>("update_min_a", 0.2);
     FOV_ = declare_parameter<double>("fov", 6.28);        // >pi -> ring lidar
@@ -355,6 +365,123 @@ private:
     return static_cast<double>(inliers) / static_cast<double>(aligned.size());
   }
 
+  // Point-to-plane ICP. Minimises distance from each scan point to the PLANE
+  // through its map neighbour, instead of to the neighbour itself.
+  //
+  // WHY IT SHOULD WIN HERE: point-to-point forces a one-to-one pairing, so on a
+  // large flat wall it pulls the solution toward whichever arbitrary map point
+  // happened to be nearest -- the "spurious correspondences on flat walls"
+  // effect already documented against map_voxel_size, and the mechanism behind
+  // the ~423 mm of measured zero-mean jitter. Point-to-plane leaves the scan
+  // free to SLIDE along a surface at no cost and only penalises motion INTO or
+  // OUT OF it, which is the correct constraint from a plane observation and
+  // exactly the geometry of an indoor environment.
+  //
+  // COST: normals must be estimated on the cropped map every call. That is the
+  // dominant added expense, so normal_k is kept small; the crop is already
+  // bounded by fov_far.
+  Eigen::Matrix4f registrationPointToPlane(const Cloud::Ptr &scan_ds,
+                                           const Cloud::Ptr &map_ds,
+                                           const Eigen::Matrix4f &guess,
+                                           double scale, double &fitness_out,
+                                           int iters)
+  {
+    // Too few points to fit planes through: fall back rather than return a
+    // garbage transform. A sparse crop is exactly where normals are worst.
+    if (map_ds->size() < 10 || scan_ds->size() < 10) {
+      pcl::IterativeClosestPoint<PointT, PointT> icp;
+      icp.setInputSource(scan_ds);
+      icp.setInputTarget(map_ds);
+      icp.setMaxCorrespondenceDistance(MAX_CORR_DIST_ * scale);
+      icp.setMaximumIterations(iters > 0 ? iters : ICP_ITERS_);
+      Cloud aligned;
+      icp.align(aligned, guess);
+      fitness_out = inlierFitness(aligned, map_ds, MAX_CORR_DIST_ * scale);
+      return icp.getFinalTransformation();
+    }
+
+    // --- normals on the target -------------------------------------------
+    pcl::NormalEstimationOMP<PointT, pcl::Normal> ne;
+    ne.setInputCloud(map_ds);
+    ne.setSearchMethod(pcl::search::KdTree<PointT>::Ptr(
+        new pcl::search::KdTree<PointT>()));
+    ne.setKSearch(NORMAL_K_);
+    pcl::PointCloud<pcl::Normal>::Ptr normals(new pcl::PointCloud<pcl::Normal>);
+    ne.compute(*normals);
+
+    CloudN::Ptr tgt(new CloudN);
+    tgt->reserve(map_ds->size());
+    for (size_t i = 0; i < map_ds->size(); ++i) {
+      // Drop points whose normal did not resolve. Feeding a NaN normal into
+      // the LLS solver poisons the whole least-squares system, so a handful of
+      // bad points would corrupt an otherwise good match.
+      if (!std::isfinite(normals->points[i].normal_x) ||
+          !std::isfinite(normals->points[i].normal_y) ||
+          !std::isfinite(normals->points[i].normal_z)) {
+        continue;
+      }
+      PointN p;
+      p.x = map_ds->points[i].x;
+      p.y = map_ds->points[i].y;
+      p.z = map_ds->points[i].z;
+      p.normal_x = normals->points[i].normal_x;
+      p.normal_y = normals->points[i].normal_y;
+      p.normal_z = normals->points[i].normal_z;
+      tgt->push_back(p);
+    }
+    if (tgt->size() < 10) {   // nearly everything failed: fall back
+      pcl::IterativeClosestPoint<PointT, PointT> icp;
+      icp.setInputSource(scan_ds);
+      icp.setInputTarget(map_ds);
+      icp.setMaxCorrespondenceDistance(MAX_CORR_DIST_ * scale);
+      icp.setMaximumIterations(iters > 0 ? iters : ICP_ITERS_);
+      Cloud aligned;
+      icp.align(aligned, guess);
+      fitness_out = inlierFitness(aligned, map_ds, MAX_CORR_DIST_ * scale);
+      return icp.getFinalTransformation();
+    }
+
+    // Source carries no normals: PointToPlaneLLS reads the TARGET's, and the
+    // scan is far too sparse for its own normals to be trustworthy anyway.
+    CloudN::Ptr src(new CloudN);
+    src->reserve(scan_ds->size());
+    for (const auto &q : scan_ds->points) {
+      PointN p;
+      p.x = q.x; p.y = q.y; p.z = q.z;
+      p.normal_x = p.normal_y = p.normal_z = 0.0f;
+      src->push_back(p);
+    }
+
+    // Plain IterativeClosestPoint with an explicit point-to-plane estimator,
+    // NOT IterativeClosestPointWithNormals: the latter also rejects
+    // correspondences on normal agreement, which would compare against the
+    // zeroed source normals above and throw away good pairs.
+    pcl::IterativeClosestPoint<PointN, PointN> icp;
+    icp.setTransformationEstimation(
+        pcl::registration::TransformationEstimationPointToPlaneLLS<
+            PointN, PointN>::Ptr(
+            new pcl::registration::TransformationEstimationPointToPlaneLLS<
+                PointN, PointN>()));
+    icp.setInputSource(src);
+    icp.setInputTarget(tgt);
+    icp.setMaxCorrespondenceDistance(MAX_CORR_DIST_ * scale);
+    icp.setMaximumIterations(iters > 0 ? iters : ICP_ITERS_);
+
+    CloudN aligned_n;
+    icp.align(aligned_n, guess);
+    const Eigen::Matrix4f T = icp.getFinalTransformation();
+
+    // Fitness stays the SAME inlier-ratio metric as point-to-point, measured
+    // over the same radius. It has to: localization_th is calibrated against
+    // it, and changing the metric under the gate would silently re-tune the
+    // acceptance threshold.
+    Cloud aligned;
+    aligned.reserve(aligned_n.size());
+    for (const auto &q : aligned_n.points) aligned.push_back(PointT(q.x, q.y, q.z));
+    fitness_out = inlierFitness(aligned, map_ds, MAX_CORR_DIST_ * scale);
+    return T;
+  }
+
   // Coarse->fine multi-scale ICP (upstream registration_at_scale).
   Eigen::Matrix4f registrationAtScale(const Cloud::Ptr &scan, const Cloud::Ptr &map,
                                       const Eigen::Matrix4f &guess, double scale,
@@ -363,6 +490,11 @@ private:
     Cloud::Ptr scan_ds(new Cloud), map_ds(new Cloud);
     voxel(scan, scan_ds, SCAN_VOXEL_ * scale);
     voxel(map, map_ds, MAP_VOXEL_ * scale);
+
+    if (POINT_TO_PLANE_) {
+      return registrationPointToPlane(scan_ds, map_ds, guess, scale,
+                                      fitness_out, iters);
+    }
 
     pcl::IterativeClosestPoint<PointT, PointT> icp;
     icp.setInputSource(scan_ds);
@@ -751,6 +883,8 @@ private:
   std::string kf_poses_path_, cloud_topic_, odom_topic_;
   std::vector<Eigen::Matrix4f> kf_poses_, kf_cands_;
   double UPDATE_MIN_D_{0.25}, UPDATE_MIN_A_{0.2};
+  bool POINT_TO_PLANE_{false};
+  int NORMAL_K_{10};
   int GLOBAL_YAW_BINS_{12}, GLOBAL_TOP_K_{5}, GLOBAL_COARSE_ITERS_{6};
   double GLOBAL_COARSE_SCALE_{5.0}, GLOBAL_SPACING_{3.0};
   bool AUTO_INIT_{false};

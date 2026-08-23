@@ -59,6 +59,50 @@
     max_corr_dist: 1.0
     icp_iterations: 40
 
+    # Point-to-plane ICP instead of point-to-point.
+    #
+    # Point-to-point forces a one-to-one pairing, so on a large flat wall it
+    # pulls the solution toward whichever arbitrary map point happened to be
+    # nearest -- the same "spurious correspondences on flat walls" effect noted
+    # against map_voxel_size above, and the mechanism behind the ~423 mm of
+    # measured zero-mean jitter. Point-to-plane minimises distance to the PLANE
+    # through the neighbour instead, so the scan may slide along a surface at no
+    # cost and is penalised only for moving INTO or OUT OF it. That is the
+    # correct constraint from a plane observation, and an indoor environment is
+    # almost entirely planes.
+    #
+    # MEASURED 2026-08-23 on slam_august_8_bag, both arms at update_min_d 5.0,
+    # 60 s windows. Point-to-plane came out WORSE and is NOT recommended:
+    #     point-to-plane   n=16  median 2832 mm  p90 7935  fitness 0.97-1.00  50 ms
+    #     point-to-point   n=23  median 1891 mm  p90 3487  fitness 0.89-0.95  25 ms
+    #
+    # Note the direction of the fitness column: point-to-plane scored HIGHER
+    # while positioning WORSE. That is the signature of its known corridor
+    # failure, and the flip side of the property that motivated trying it. By
+    # removing the tangential penalty it lets the scan slide freely along a
+    # surface -- excellent when the geometry constrains the along-track
+    # direction, but in a feature-poor corridor nothing does, so the solution
+    # slides while every point still lands on a plane and fitness reads near
+    # perfect. High fitness stops being evidence of a good lock.
+    #
+    # INDICATIVE, NOT CONCLUSIVE: n is small, FAST-LIO replay is
+    # nondeterministic (see the loop-noise note in fastlio_lc_pgo), and both
+    # arms are inflated by the 5 m gate spacing plus the initial convergence,
+    # which is why both medians sit far above the 153 mm historical figure
+    # measured ungated at 2 Hz. The RANKING between arms is the usable result.
+    #
+    # OFF by default. localization_th is calibrated against point-to-point
+    # fitness; re-check it if this is ever switched on.
+    #
+    # Falls back to point-to-point automatically when the cropped map is too
+    # sparse to fit planes through, or when normal estimation fails on nearly
+    # every point.
+    point_to_plane: false
+    # Neighbours used per map-point normal. Larger is smoother and slower;
+    # normals are re-estimated on the cropped map every correction, which is the
+    # dominant added cost of point-to-plane.
+    normal_k: 10
+
     # --- acceptance ---------------------------------------------------------
     # Minimum inlier-ratio fitness to accept a match and publish a correction.
     # 0.95 is only reachable with max_corr_dist 1.0 (measured 0.98 there); at
