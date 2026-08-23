@@ -106,21 +106,44 @@
     #
     # 2026-08-22: update_min_d 0.25 -> 5.0. AMCL's 0.25 is sized for WHEEL
     # odometry, which drifts an order of magnitude worse than lidar-inertial.
-    # Evidence corrections here are noise-dominated rather than drift-dominated:
-    # at 2 Hz the median correction was 153 mm while the robot had moved ~2 cm
-    # between them, so most of each correction was ICP scatter, not accumulated
-    # error. Correcting less often therefore injects less noise.
+    #
+    # MEASURED: FAST-LIO closed the full run to 0.1% of path length (returned to
+    # its start point over ~165 m). At that drift rate the gate costs:
+    #     5 m   ->    5 mm accumulated drift
+    #    25 m   ->   25 mm  (half a 0.05 m costmap cell)
+    #   153 m   ->  153 mm
+    # against a MEASURED median ICP correction of 153 mm. So over this 5 m gate
+    # each correction injects ~30x more scatter than the drift it removes, and
+    # you would have to drive ~153 m before drift even equalled the noise in a
+    # single correction. Corrections here are noise injection, not drift
+    # removal, and 5 m is conservative rather than aggressive.
+    #
+    # CAVEAT on that 0.1%: loop closure measures END-POINT error, and an
+    # out-and-back path lets systematic bias cancel. Worst-case mid-run
+    # excursion is larger than the closure figure implies, which is part of why
+    # this is not set to 25 m. The other part is below.
     #
     # update_min_a stays TIGHT on purpose. Yaw is FAST-LIO's weakest axis (see
     # utils/L2_IMU/REPORT.md and the l2_rsimu.yaml rationale), so rotation is
     # where the correction is actually earning its keep. Do not raise it to
     # match update_min_d.
     #
+    # WHY NOT LARGER, given drift is negligible: with drift this small the
+    # correction is no longer doing drift removal at all -- its remaining job is
+    # DETECTION. It is what notices the robot has been bumped, pushed, or has
+    # locked onto the wrong place, and none of that scales with distance
+    # travelled. Stretching the gate stretches the blind window for those.
+    #
     # KNOWN COST: at max_vel_x 0.5 m/s, 5 m is ~10 s of driving on a stale
     # correction. Nothing here detects a bad lock and corrects early -- if a
     # match goes wrong, or the robot is disturbed, that is how long the global
     # costmap plans against a stale pose. Lower this (1-2 m) if navigation ever
     # looks confidently misplaced in a crowd.
+    #
+    # NEXT LEVER, now that odometry is not the limit: the 153 mm ICP scatter is
+    # the dominant pose error. Improving it means attacking the registration
+    # (map_voxel_size, scan_voxel_size, a point-to-plane ICP instead of
+    # point-to-point), NOT the correction rate.
     #
     # Set BOTH to 0.0 to restore purely time-based correction.
     update_min_d: 5.0      # metres travelled before the next correction
