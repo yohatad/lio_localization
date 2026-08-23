@@ -91,6 +91,12 @@ public:
     odom_frame_ = declare_parameter<std::string>("odom_frame", "odom");
     body_frame_ = declare_parameter<std::string>("body_frame", "body");
     double rate = declare_parameter<double>("fusion_rate", 50.0);  // upstream: 50 Hz
+    // How far ahead the broadcast map -> odom is stamped. AMCL's default in
+    // Nav2 is 1.0 s; 0.1 is ample here because this rebroadcasts at
+    // fusion_rate (50 Hz, i.e. every 20 ms) rather than only on filter update.
+    // Too large and a consumer keeps using a stale correction after a real
+    // relocalization; too small and lookups fail on ordinary jitter.
+    transform_tolerance_ = declare_parameter<double>("transform_tolerance", 0.1);
     // REGRESSION FIX 2026-08-12: was hardcoded "/Odometry", which every mapping
     // launch now remaps onto /odom_lio -- so this had zero publishers and the
     // node silently never saw odometry. See the same fix in global_localization.
@@ -229,7 +235,14 @@ private:
     q.normalize();
 
     geometry_msgs::msg::TransformStamped tf;
-    tf.header.stamp = now();
+    // Post-date by transform_tolerance, as AMCL does. A consumer looking up
+    // map -> odom at a stamp slightly AHEAD of the last broadcast (its own
+    // sensor stamp, a control cycle scheduled a few ms out) would otherwise
+    // extrapolate-fail rather than reuse a transform that is still perfectly
+    // valid -- map -> odom is piecewise-constant between corrections, so
+    // declaring it good a little into the future costs no accuracy.
+    tf.header.stamp = rclcpp::Time(now()) +
+                      rclcpp::Duration::from_seconds(transform_tolerance_);
     tf.header.frame_id = map_frame_;
     tf.child_frame_id = odom_frame_;
     tf.transform.translation.x = T(0, 3);
@@ -301,6 +314,8 @@ private:
       pub_localization_->publish(loc);
     }
   }
+
+  double transform_tolerance_{0.1};
 
   std::string map_frame_, odom_frame_, body_frame_, odom_topic_;
   Eigen::Matrix4f T_map_to_odom_;

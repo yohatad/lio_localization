@@ -126,6 +126,12 @@ public:
     LOCALIZATION_TH_ = declare_parameter<double>("localization_th", 0.90);
     MAX_CORR_DIST_ = declare_parameter<double>("max_corr_dist", 0.25);
     ICP_ITERS_ = declare_parameter<int>("icp_iterations", 40);
+    // Motion gate (AMCL's update_min_d / update_min_a). Corrections are skipped
+    // until the robot has moved this far in the odom frame since the last one.
+    // 0.0 for either disables the gate on that axis; 0.0 for both restores
+    // purely time-based correction.
+    UPDATE_MIN_D_ = declare_parameter<double>("update_min_d", 0.25);
+    UPDATE_MIN_A_ = declare_parameter<double>("update_min_a", 0.2);
     FOV_ = declare_parameter<double>("fov", 6.28);        // >pi -> ring lidar
     FOV_FAR_ = declare_parameter<double>("fov_far", 30.0);
 
@@ -516,17 +522,63 @@ private:
     return false;
   }
 
+  // Correction loop. MOTION-GATED, not purely time-driven.
+  //
+  // WHY. A stationary robot generates no new information, so an ICP match
+  // computed at rest is measurement noise being injected straight into
+  // map -> odom: the pose visibly wanders while the robot is standing still.
+  // Running on a bare timer also spends CPU re-deriving a correction that
+  // cannot have changed. AMCL has gated on distance travelled since forever
+  // (update_min_d 0.25 m, update_min_a 0.2 rad); this is the same rule.
+  //
+  // FREQ_ still bounds the loop from ABOVE -- it is the maximum correction
+  // rate, not the rate itself. Motion decides whether each tick does work.
+  //
+  // Set update_min_d and update_min_a to 0.0 to restore the old purely
+  // time-based behaviour.
   void locLoop()
   {
     const auto period = std::chrono::duration<double>(1.0 / FREQ_);
+    bool have_last = false;
+    Eigen::Matrix4f last_odom = Eigen::Matrix4f::Identity();
+
     while (running_ && rclcpp::ok()) {
       std::this_thread::sleep_for(period);
       if (!initialized_) continue;
-      Eigen::Matrix4f guess;
+
+      Eigen::Matrix4f guess, odom_now;
+      bool have_odom = false;
       {
         std::lock_guard<std::mutex> lk(mtx_);
         guess = T_map_to_odom_;
+        if (cur_odom_) {
+          odom_now = poseToMat(cur_odom_->pose.pose);
+          have_odom = true;
+        }
       }
+
+      // Measure movement in the ODOM frame, which is continuous by REP-105.
+      // Doing it in map would fold our own corrections back into the gate and
+      // let ICP noise masquerade as robot motion, re-triggering itself.
+      if (have_odom && (UPDATE_MIN_D_ > 0.0 || UPDATE_MIN_A_ > 0.0)) {
+        if (have_last) {
+          const Eigen::Matrix4f delta = last_odom.inverse() * odom_now;
+          const double d = delta.block<3, 1>(0, 3).norm();
+          // Rotation angle of the delta, from the trace of its rotation block.
+          const double tr = delta.block<3, 3>(0, 0).trace();
+          const double a = std::acos(
+              std::max(-1.0, std::min(1.0, (tr - 1.0) / 2.0)));
+          if (d < UPDATE_MIN_D_ && a < UPDATE_MIN_A_) {
+            // Below threshold: hold the last correction. Holding is correct,
+            // not lazy -- map -> odom is only stale to the extent odometry has
+            // drifted, and by definition it has barely moved.
+            continue;
+          }
+        }
+        last_odom = odom_now;
+        have_last = true;
+      }
+
       globalLocalization(guess);  // scan already in odom frame
     }
   }
@@ -698,6 +750,7 @@ private:
   std::string map_pcd_, map_frame_, odom_frame_, base_frame_;
   std::string kf_poses_path_, cloud_topic_, odom_topic_;
   std::vector<Eigen::Matrix4f> kf_poses_, kf_cands_;
+  double UPDATE_MIN_D_{0.25}, UPDATE_MIN_A_{0.2};
   int GLOBAL_YAW_BINS_{12}, GLOBAL_TOP_K_{5}, GLOBAL_COARSE_ITERS_{6};
   double GLOBAL_COARSE_SCALE_{5.0}, GLOBAL_SPACING_{3.0};
   bool AUTO_INIT_{false};

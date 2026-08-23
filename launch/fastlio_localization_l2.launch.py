@@ -6,7 +6,7 @@ from ament_index_python.packages import (
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PythonExpression
 
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
@@ -93,6 +93,14 @@ def generate_launch_description():
     declare_use_sim_time_cmd = DeclareLaunchArgument(
         'use_sim_time', default_value='true',
         description='true for bag replay (--clock); false on the robot.')
+    declare_sensor_tf_scope_cmd = DeclareLaunchArgument(
+        'sensor_tf_scope',
+        default_value=PythonExpression(
+            ["'all' if '", use_sim_time, "' == 'true' else 'mount'"]),
+        description="'all' publishes the camera edges from calibration, needed "
+                    "for bag replay where no RealSense driver runs. 'mount' on "
+                    "the real robot so the driver's device-read values win. "
+                    "Derived from use_sim_time; override only for the odd case.")
     declare_config_file_cmd = DeclareLaunchArgument(
         'config_file', default_value='l2_rsimu.yaml',
         description='FAST-LIO config. l2_rsimu.yaml drives the estimator from '
@@ -115,10 +123,18 @@ def generate_launch_description():
 
     # base_footprint -> l2lidar_frame -> l2lidar_frame_imu (+ cams). The lio bridge
     # needs the static base_footprint -> l2lidar_frame_imu to close odom->base_footprint.
+    # scope must be 'all' on BAG REPLAY and 'mount' on the robot, and the two
+    # answer the same question: is a RealSense driver running? Derived from
+    # use_sim_time so it cannot be forgotten -- which matters now that the
+    # default config is l2_rsimu.yaml, whose body frame is
+    # camera_imu_optical_frame. Under the 'mount' default that frame is never
+    # published on a bag (no driver), so lio_map_odom_bridge cannot close
+    # odom -> base_footprint and the tree comes up in two halves.
     sensor_tf_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(sensor_tf_share, 'launch', 'pepper_sensor_tf.launch.py')),
-        launch_arguments={'use_sim_time': use_sim_time}.items())
+        launch_arguments={'use_sim_time': use_sim_time,
+                          'scope': LaunchConfiguration('sensor_tf_scope')}.items())
 
     # FAST-LIO odometry ONLY (no PGO). Publishes /Odometry + /cloud_registered
     # in the 'odom_lidar' frame; lio_map_odom_bridge closes
@@ -218,6 +234,7 @@ def generate_launch_description():
     ld.add_action(declare_rviz_cmd)
     ld.add_action(declare_rviz_cfg_cmd)
     ld.add_action(declare_use_sim_time_cmd)
+    ld.add_action(declare_sensor_tf_scope_cmd)
     ld.add_action(declare_config_file_cmd)
     ld.add_action(declare_lidar_imu_frame_cmd)
     ld.add_action(declare_params_cmd)

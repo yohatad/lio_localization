@@ -85,8 +85,35 @@
     # was not in use. That dead argument has been removed.
     freq_localization: 2.0
 
+    # MOTION GATE (AMCL's update_min_d / update_min_a).
+    #
+    # freq_localization above is now the MAXIMUM correction rate, not the rate.
+    # A correction only runs once the robot has moved this far in the ODOM
+    # frame since the last one. Measured in odom, not map, deliberately: odom
+    # is continuous by REP-105, whereas measuring in map would fold our own
+    # corrections back into the gate and let ICP noise masquerade as motion,
+    # re-triggering itself.
+    #
+    # WHY: a stationary robot generates no new information, so a match computed
+    # at rest is measurement noise injected straight into map -> odom -- the
+    # pose visibly wanders while the robot stands still. Holding the last
+    # correction instead is correct, not lazy: map -> odom only goes stale as
+    # fast as odometry drifts, and a robot that has not moved has not drifted.
+    #
+    # Set BOTH to 0.0 to restore purely time-based correction.
+    update_min_d: 0.25     # metres travelled before the next correction
+    update_min_a: 0.2      # radians rotated before the next correction
+
     # Rate transform_fusion rebroadcasts the latest correction as TF.
     fusion_rate: 50.0
+
+    # How far ahead the broadcast map -> odom is stamped, so a consumer looking
+    # up a stamp slightly in the future (its own sensor stamp, a control cycle
+    # scheduled a few ms out) reuses a still-valid transform instead of failing
+    # to extrapolate. map -> odom is piecewise-constant between corrections, so
+    # declaring it good a little ahead costs no accuracy. AMCL's Nav2 default
+    # is 1.0 s; 0.1 is ample here because this rebroadcasts at fusion_rate.
+    transform_tolerance: 0.1
 
     # --- reported uncertainty -----------------------------------------------
     # The pose covariance stamped on /map_to_odom, and forwarded by
