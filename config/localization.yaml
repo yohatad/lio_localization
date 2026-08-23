@@ -103,6 +103,60 @@
     # dominant added cost of point-to-plane.
     normal_k: 10
 
+    # --- plausibility (innovation gate) --------------------------------------
+    # Fitness alone cannot separate a true lock from a confident WRONG one. In a
+    # corridor the ICP cost surface is nearly flat along the corridor axis, so
+    # the solution slides while every point still lands on a wall and the inlier
+    # ratio reads near-perfect -- MEASURED: the point-to-plane arm scored
+    # 0.97-1.00 while positioning WORSE than point-to-point.
+    #
+    # This gates on something fitness does not know: how far the robot actually
+    # travelled. Odometry drifts at a measured 0.1% of path length, so over a
+    # known distance there is a bound on how far map -> odom can legitimately
+    # need to move. Beyond it the match is not correcting drift, it is relocating.
+    #
+    # WHY IT WAS ADDED: measured corrections were 1891 mm median after a 5 m
+    # gate, where 0.1% drift predicts ~5 mm -- roughly 400x more than drift can
+    # explain, i.e. bad matches being accepted, not scatter.
+    #
+    # This is the standard innovation / Mahalanobis gate of any Kalman-style
+    # estimator, sized from a measured drift rate instead of a covariance.
+    innovation_gate: true
+    odom_drift_rate: 0.001          # MEASURED: 0.1% closure over a ~165 m run
+    innovation_safety_factor: 10.0  # generous: 0.1% is END-POINT closure, which
+                                    # lets systematic bias cancel, so true
+                                    # mid-run drift exceeds what it implies
+    innovation_min: 0.30            # metres. Floor, so a correction taken at a
+                                    # standstill does not get a zero budget and
+                                    # reject everything. Above a good lock's
+                                    # scatter, below a real relocalization.
+    #
+    # MEASURED 2026-08-23 on slam_august_8_bag, 60 s windows, same config
+    # otherwise. map -> odom step magnitude:
+    #     no gate            n=23  median 1891 mm  p90 3487  max 7110
+    #     innovation gate    n=22  median  309 mm  p90  751  max 1085
+    # A ~6x reduction in both median and worst case.
+    #
+    # What it rejected proves the diagnosis -- every one of these passed the
+    # fitness gate:
+    #     1.41 m jump after 0.09 m travelled, fitness 0.964
+    #     0.69 m jump after 0.08 m travelled, fitness 0.992
+    #     0.66 m jump after 0.90 m travelled, fitness 1.000
+    # A metre of correction after nine centimetres of travel is not drift, and
+    # fitness 0.99 did not notice. That is what this gate is for.
+    #
+    # NOTE the residual median (309 mm) now sits essentially AT innovation_min
+    # (300 mm), so the floor -- not the drift budget -- is what bounds the
+    # remaining jumping. Lower innovation_min to push further, at the risk of
+    # rejecting good corrections; that is the next knob, not the safety factor.
+    innovation_max_rejects: 3       # consecutive violations before the gate
+                                    # yields. A genuine relocalization (bumped,
+                                    # pushed, carried) also violates the gate and
+                                    # must not be locked out forever: one outlier
+                                    # is noise, several in a row are the world.
+                                    # Too low waves a corridor slide through; too
+                                    # high makes real recovery slow.
+
     # --- acceptance ---------------------------------------------------------
     # Minimum inlier-ratio fitness to accept a match and publish a correction.
     # 0.95 is only reachable with max_corr_dist 1.0 (measured 0.98 there); at

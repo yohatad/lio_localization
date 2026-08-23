@@ -138,6 +138,23 @@ public:
     // Point-to-plane ICP instead of point-to-point. OFF by default: the
     // 153 mm-scatter baseline everything else is tuned against was measured
     // with point-to-point, so this must be A/B'd before it becomes the default.
+    // Innovation gate: reject corrections larger than measured drift can
+    // explain over the distance travelled. See the long note at the accept
+    // site. innovation_gate:false disables it entirely.
+    INNOV_ENABLED_ = declare_parameter<bool>("innovation_gate", true);
+    // MEASURED: FAST-LIO closed a full ~165 m run to 0.1% of path length.
+    DRIFT_RATE_ = declare_parameter<double>("odom_drift_rate", 0.001);
+    // Multiplier on the drift budget. 10x is deliberately generous: the 0.1%
+    // figure is END-POINT loop closure, which lets systematic bias cancel, so
+    // true mid-run drift is larger than it implies.
+    INNOV_SAFETY_ = declare_parameter<double>("innovation_safety_factor", 10.0);
+    // Floor, in metres. Without it a correction taken at a standstill would get
+    // a zero budget and every match would be rejected. Sized above the ICP
+    // scatter a good lock produces, not above a real relocalization.
+    INNOV_MIN_ = declare_parameter<double>("innovation_min", 0.30);
+    // Consecutive violations before the gate yields. Too low and a corridor
+    // slide is waved through; too high and real relocalization is slow.
+    INNOV_MAX_REJECTS_ = declare_parameter<int>("innovation_max_rejects", 3);
     POINT_TO_PLANE_ = declare_parameter<bool>("point_to_plane", false);
     NORMAL_K_ = declare_parameter<int>("normal_k", 10);
     UPDATE_MIN_D_ = declare_parameter<double>("update_min_d", 0.25);
@@ -242,6 +259,13 @@ public:
           return;
         }
         initialized_ = false;   // stop steady-state tracking off a stale fix
+        // Drop the innovation gate's baseline too. /relocalize means "I do not
+        // trust where I think I am", so the last accepted pose is exactly what
+        // must NOT be used to judge the plausibility of the new one -- keeping
+        // it would make the gate reject the correct answer for disagreeing
+        // with the fix we just disowned.
+        have_last_accept_ = false;
+        consec_rejects_ = 0;
         startGlobalSearch();
         res->success = true;
         res->message = "Global search started in the background; watch the log.";
@@ -641,10 +665,75 @@ private:
     publishCloud(pub_scan_in_map_, scan_in_map, odom.header.stamp);
 
     if (fitness > LOCALIZATION_TH_) {
+      // --- INNOVATION GATE --------------------------------------------------
+      // Fitness alone cannot separate a true lock from a confident WRONG one:
+      // in a corridor the ICP cost surface is nearly flat along the corridor
+      // axis, so the solution slides while every point still lands on a wall
+      // and the inlier ratio reads near-perfect. MEASURED: the point-to-plane
+      // arm scored 0.97-1.00 while positioning WORSE than point-to-point.
+      //
+      // So gate on PLAUSIBILITY instead, using the one thing fitness does not
+      // know: how far the robot has actually travelled. Odometry drifts at a
+      // measured 0.001 (0.1% of path length, full-run loop closure), so over a
+      // known distance there is a bound on how much map -> odom can legitimately
+      // need to move. A correction far beyond that bound is not correcting
+      // drift -- it is relocating, which for a robot that has driven 5 m in a
+      // known direction means the match is wrong.
+      //
+      // This is the standard innovation / Mahalanobis gate of any Kalman-style
+      // estimator, sized from a measured drift rate rather than a covariance.
+      //
+      // ESCAPE HATCH: a genuine relocalization (robot bumped, pushed, carried)
+      // also violates the gate, and must not be locked out forever. Consecutive
+      // violations are counted, and once innovation_max_rejects of them agree
+      // that the pose has moved, the correction is accepted. One outlier is
+      // noise; several in a row are the world.
+      bool gated = false;
+      if (INNOV_ENABLED_ && !from_search && have_last_accept_) {
+        Eigen::Matrix4f prev;
+        {
+          std::lock_guard<std::mutex> lk(mtx_);
+          prev = T_map_to_odom_;
+        }
+        // How far the ROBOT moved since the last accepted correction, in odom
+        // (continuous by REP-105, and unaffected by our own corrections).
+        const Eigen::Matrix4f odom_now = poseToMat(odom.pose.pose);
+        const double d_travel =
+            (last_accept_odom_.inverse() * odom_now).block<3, 1>(0, 3).norm();
+        // How much map -> odom is being asked to jump.
+        const double innovation =
+            (transf.block<3, 1>(0, 3) - prev.block<3, 1>(0, 3)).norm();
+        // Budget: drift over that distance, times a safety factor, with a floor
+        // so ICP scatter at a standstill is not gated to zero.
+        const double budget =
+            std::max(INNOV_MIN_, DRIFT_RATE_ * d_travel * INNOV_SAFETY_);
+
+        if (innovation > budget) {
+          ++consec_rejects_;
+          if (consec_rejects_ < INNOV_MAX_REJECTS_) {
+            RCLCPP_WARN(get_logger(),
+                "REJECTED implausible correction: %.2f m jump after %.2f m "
+                "travelled (budget %.2f m), fitness %.3f. %d/%d consecutive -- "
+                "accepting anyway at %d.",
+                innovation, d_travel, budget, fitness,
+                consec_rejects_, INNOV_MAX_REJECTS_, INNOV_MAX_REJECTS_);
+            return false;
+          }
+          RCLCPP_WARN(get_logger(),
+              "Accepting %.2f m correction after %d consecutive violations -- "
+              "treating as a genuine relocalization, not an outlier.",
+              innovation, consec_rejects_);
+          gated = true;
+        }
+      }
+      if (!gated) consec_rejects_ = 0;
+
       {
         std::lock_guard<std::mutex> lk(mtx_);
         T_map_to_odom_ = transf;
       }
+      last_accept_odom_ = poseToMat(odom.pose.pose);
+      have_last_accept_ = true;
       publishMapToOdom(transf, odom.header.stamp, fitness);
       RCLCPP_INFO(get_logger(), "matched (fitness %.3f, %.0f ms)", fitness, dt_ms);
       return true;
@@ -884,6 +973,12 @@ private:
   std::vector<Eigen::Matrix4f> kf_poses_, kf_cands_;
   double UPDATE_MIN_D_{0.25}, UPDATE_MIN_A_{0.2};
   bool POINT_TO_PLANE_{false};
+  bool INNOV_ENABLED_{true};
+  double DRIFT_RATE_{0.001}, INNOV_SAFETY_{10.0}, INNOV_MIN_{0.30};
+  int INNOV_MAX_REJECTS_{3};
+  Eigen::Matrix4f last_accept_odom_{Eigen::Matrix4f::Identity()};
+  bool have_last_accept_{false};
+  int consec_rejects_{0};
   int NORMAL_K_{10};
   int GLOBAL_YAW_BINS_{12}, GLOBAL_TOP_K_{5}, GLOBAL_COARSE_ITERS_{6};
   double GLOBAL_COARSE_SCALE_{5.0}, GLOBAL_SPACING_{3.0};
