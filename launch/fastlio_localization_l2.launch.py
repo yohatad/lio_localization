@@ -151,21 +151,9 @@ def generate_launch_description():
             os.path.join(fast_lio_share, 'launch', 'mapping.launch.py')),
         launch_arguments={
             'config_file': LaunchConfiguration('config_file'),
-            # MUST match the IMU the config selects, or lio_map_odom_bridge
-            # closes odom -> base_footprint through the wrong static frame and
-            # the pose comes out rotated with no error anywhere.
-            'lidar_imu_frame': LaunchConfiguration('lidar_imu_frame'),
             'rviz': rviz,
             'rviz_cfg': rviz_cfg,
             'use_sim_time': use_sim_time,
-            # 'odom' (leveled) is published as a CHILD of lio_init here:
-            # transform_fusion owns map -> lio_init, so it cannot also be
-            # lio_init's parent. Leveling stays ON because the costmaps and
-            # collision monitor need a gravity-aligned, floor-referenced frame,
-            # and raw lio_init is neither (and means different things on
-            # FAST-LIO vs Point-LIO).
-            'bridge_level_frame': 'true',
-            'level_frame_as_child': 'true',
         }.items())
 
     # Registers /cloud_registered (odom frame) against the prior map, producing map -> lio_init.
@@ -237,7 +225,27 @@ def generate_launch_description():
     ld.add_action(declare_params_cmd)
     ld.add_action(OpaqueFunction(function=_check_map_pcd_exists))
     ld.add_action(sensor_tf_launch)
+    # odom -> base_footprint. FAST_LIO's mapping.launch.py no longer starts this
+    # (see FAST_LIO d8b274c): it was Pepper glue in a launch file shared with
+    # every other FAST-LIO sensor config.
+    lio_bridge_launch = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            os.path.join(get_package_share_directory('pepper_slam'),
+                         'launch', 'lio_odom_bridge.launch.py')),
+        launch_arguments={
+            'use_sim_time': use_sim_time,
+            'config_file': LaunchConfiguration('config_file'),
+            'lidar_imu_frame': LaunchConfiguration('lidar_imu_frame'),
+            # 'odom' (leveled) is a CHILD of lio_init here: transform_fusion owns
+            # map -> lio_init, so it cannot also be lio_init's parent. Leveling
+            # stays ON -- the costmaps and collision monitor need a
+            # gravity-aligned, floor-referenced frame and raw lio_init is neither.
+            'bridge_level_frame': 'true',
+            'level_frame_as_child': 'true',
+        }.items())
+
     ld.add_action(fast_lio_launch)
+    ld.add_action(lio_bridge_launch)
     ld.add_action(global_localization)
     ld.add_action(transform_fusion)
     return ld
