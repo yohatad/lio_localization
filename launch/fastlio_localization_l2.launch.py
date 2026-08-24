@@ -90,17 +90,16 @@ def generate_launch_description():
         # ICP correction moves the map around a stationary robot.
         default_value=os.path.join(
             localization_share, 'rviz', 'localization.rviz'))
+    # false, NOT true: this is the LIVE entry point. Every wrapper in
+    # pepper_slam/launch/bag_test sets use_sim_time:='true' explicitly, so this
+    # default only ever applies on the robot -- where 'true' pins sim time at 0,
+    # so tf never resolves and nothing fuses, silently and with no error.
+    # It also feeds the sensor_tf scope derivation: false -> 'mount', correct
+    # live because the RealSense driver publishes its own camera edges (adding a
+    # second copy is the nondeterministic-latch problem sensor_tf.yaml warns of).
     declare_use_sim_time_cmd = DeclareLaunchArgument(
-        'use_sim_time', default_value='true',
-        description='true for bag replay (--clock); false on the robot.')
-    declare_sensor_tf_scope_cmd = DeclareLaunchArgument(
-        'sensor_tf_scope',
-        default_value=PythonExpression(
-            ["'all' if '", use_sim_time, "' == 'true' else 'mount'"]),
-        description="'all' publishes the camera edges from calibration, needed "
-                    "for bag replay where no RealSense driver runs. 'mount' on "
-                    "the real robot so the driver's device-read values win. "
-                    "Derived from use_sim_time; override only for the odd case.")
+        'use_sim_time', default_value='false',
+        description='false (default) on the robot; true for bag replay with ros2 bag play --clock. The bag_test wrappers set this for you.')
     declare_config_file_cmd = DeclareLaunchArgument(
         'config_file', default_value='l2_rsimu.yaml',
         description='FAST-LIO config. l2_rsimu.yaml drives the estimator from '
@@ -133,12 +132,11 @@ def generate_launch_description():
     sensor_tf_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(sensor_tf_share, 'launch', 'pepper_sensor_tf.launch.py')),
-        launch_arguments={'use_sim_time': use_sim_time,
-                          'scope': LaunchConfiguration('sensor_tf_scope')}.items())
+        launch_arguments={'use_sim_time': use_sim_time}.items())
 
     # FAST-LIO odometry ONLY (no PGO). Publishes /Odometry + /cloud_registered
-    # in the 'odom_lidar' frame; lio_map_odom_bridge closes
-    # odom_lidar -> base_footprint.
+    # in the 'lio_init' frame; lio_map_odom_bridge closes
+    # lio_init -> base_footprint.
     #
     # 2026-08-22: config_file was HARDCODED to l2.yaml, i.e. the L2's own IMU,
     # while the map this localizes against was built with l2_rsimu.yaml and
@@ -160,17 +158,17 @@ def generate_launch_description():
             'rviz': rviz,
             'rviz_cfg': rviz_cfg,
             'use_sim_time': use_sim_time,
-            # 'odom' (leveled) is published as a CHILD of odom_lidar here:
-            # transform_fusion owns map -> odom_lidar, so it cannot also be
-            # odom_lidar's parent. Leveling stays ON because the costmaps and
+            # 'odom' (leveled) is published as a CHILD of lio_init here:
+            # transform_fusion owns map -> lio_init, so it cannot also be
+            # lio_init's parent. Leveling stays ON because the costmaps and
             # collision monitor need a gravity-aligned, floor-referenced frame,
-            # and raw odom_lidar is neither (and means different things on
+            # and raw lio_init is neither (and means different things on
             # FAST-LIO vs Point-LIO).
             'bridge_level_frame': 'true',
             'level_frame_as_child': 'true',
         }.items())
 
-    # Registers /cloud_registered (odom frame) against the prior map, producing map -> odom_lidar.
+    # Registers /cloud_registered (odom frame) against the prior map, producing map -> lio_init.
     global_localization = Node(
         package='lio_localization',
         executable='global_localization',
@@ -186,7 +184,7 @@ def generate_launch_description():
             'auto_initialize': ParameterValue(
                 LaunchConfiguration('auto_initialize'), value_type=bool),
             'map_frame': 'map',
-            'odom_frame': 'odom_lidar',
+            'odom_frame': 'lio_init',
             'scan_voxel_size': 0.1,
             'fov': 6.28,        # L2 is 360 deg -> ring crop (distance only)
         }],
@@ -204,7 +202,7 @@ def generate_launch_description():
         parameters=[LaunchConfiguration('params_file'), {
             'use_sim_time': use_sim_time,
             'map_frame': 'map',
-            'odom_frame': 'odom_lidar',
+            'odom_frame': 'lio_init',
             'body_frame': 'base_footprint',   # /localization pose is map -> base
             'fusion_rate': 50.0,
         }],
@@ -234,7 +232,6 @@ def generate_launch_description():
     ld.add_action(declare_rviz_cmd)
     ld.add_action(declare_rviz_cfg_cmd)
     ld.add_action(declare_use_sim_time_cmd)
-    ld.add_action(declare_sensor_tf_scope_cmd)
     ld.add_action(declare_config_file_cmd)
     ld.add_action(declare_lidar_imu_frame_cmd)
     ld.add_action(declare_params_cmd)

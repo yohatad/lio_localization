@@ -1,10 +1,10 @@
 // C++ port of FAST_LIO_LOCALIZATION's transform_fusion.py.
 //
 // Faithful to upstream (HViktorTsoi/FAST_LIO_LOCALIZATION): broadcasts the
-// map->odom_lidar TF at FREQ_PUB_LOCALIZATION (50 Hz) from the latest
+// map->lio_init TF at FREQ_PUB_LOCALIZATION (50 Hz) from the latest
 // /map_to_odom correction (global_localization publishes it at only ~0.5 Hz),
 // so TF lookups stay fresh between ICP updates while the LIO's
-// odom_lidar->body supplies the smooth high-rate motion underneath. Also
+// lio_init->body supplies the smooth high-rate motion underneath. Also
 // republishes the fused pose map->body on /localization/pose, using the odom's
 // own stamp.
 //
@@ -24,13 +24,13 @@
 // and its clouds, i.e. the LIO's OWN world frame. FAST-LIO does no loop closure
 // or relocalization, so it cannot produce a REP-105 'map' frame at all.
 //
-// This workspace sets publish.map_frame:="odom_lidar" (see FAST_LIO/config/
+// This workspace sets publish.map_frame:="lio_init" (see FAST_LIO/config/
 // l2.yaml), naming that frame for what it is: the LIO's native, gravity-tilted
 // odometry frame. It must NOT be plain 'odom' -- that name now belongs to the
 // leveled, floor-referenced frame published by lio_map_odom_bridge, and having
 // the tilted output claim it is exactly the bug that saved a 90-deg-tilted map.
 //
-// So this node broadcasts map -> odom_lidar; both frames are parameterised
+// So this node broadcasts map -> lio_init; both frames are parameterised
 // (map_frame / odom_frame below). See pepper_slam/FRAMES.md.
 
 #include <array>

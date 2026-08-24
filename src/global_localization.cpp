@@ -6,14 +6,14 @@
 // faithful to upstream; adaptations are only names/frames for this workspace:
 //
 //   * Prior map is in 'map' (leveled, floor-referenced). The LIO publishes
-//     /cloud_registered in 'odom_lidar' -- its own gravity-tilted world frame,
+//     /cloud_registered in 'lio_init' -- its own gravity-tilted world frame,
 //     named by the backend's publish.map_frame param, which is a LOAM-era
 //     misnomer for "the frame I stamp my output in" and NOT a REP-105 map
 //     frame. With publish_tf:=false the backend broadcasts no TF of its own, so
 //     ICP of that scan against the prior map directly yields the
-//     map->odom_lidar correction, published on /map_to_odom
+//     map->lio_init correction, published on /map_to_odom
 //     (nav_msgs/Odometry, frame_id 'map'). transform_fusion turns it into the
-//     map->odom_lidar TF at 50 Hz.
+//     map->lio_init TF at 50 Hz.
 //   * Prior map loaded straight from a .pcd path (map_pcd param).
 //   * FITNESS: Open3D's ICP fitness is the INLIER RATIO (fraction of source
 //     points with a correspondence within max_corr_dist; higher=better). PCL's

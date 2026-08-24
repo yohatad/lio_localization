@@ -106,15 +106,22 @@ def generate_launch_description():
         'rviz_cfg',
         default_value=os.path.join(
             localization_share, 'rviz', 'localization.rviz'))
+    # false, NOT true: this is the LIVE entry point. Every wrapper in
+    # pepper_slam/launch/bag_test sets use_sim_time:='true' explicitly, so this
+    # default only ever applies on the robot -- where 'true' pins sim time at 0,
+    # so tf never resolves and nothing fuses, silently and with no error.
+    # It also feeds the sensor_tf scope derivation: false -> 'mount', correct
+    # live because the RealSense driver publishes its own camera edges (adding a
+    # second copy is the nondeterministic-latch problem sensor_tf.yaml warns of).
     declare_use_sim_time_cmd = DeclareLaunchArgument(
-        'use_sim_time', default_value='true',
-        description='true for bag replay (--clock); false on the robot.')
+        'use_sim_time', default_value='false',
+        description='false (default) on the robot; true for bag replay with ros2 bag play --clock. The bag_test wrappers set this for you.')
     declare_localization_th_cmd = DeclareLaunchArgument(
         'localization_th', default_value='0.95',
         description='Min ICP inlier-ratio fitness to accept a match. 0.90 was '
                     'upstream\'s value and is too strict for the L2 on this rig: '
                     'measured 0.793 on bags/July_22, so EVERY match was rejected '
-                    'and no map -> odom_lidar was ever published. At 0.70 the same '
+                    'and no map -> lio_init was ever published. At 0.70 the same '
                     'bag locks at 0.978. Raise it if you see it locking onto the '
                     'wrong place; lower it further if it never locks at all.')
     declare_freq_cmd = DeclareLaunchArgument(
@@ -134,11 +141,11 @@ def generate_launch_description():
         launch_arguments={'use_sim_time': use_sim_time}.items())
 
     # Point-LIO odometry ONLY (no PGO). Publishes /aft_mapped_to_init +
-    # /cloud_registered in the 'odom_lidar' frame; lio_map_odom_bridge closes
-    # odom_lidar -> base_footprint. 'odom' (leveled) is published as a CHILD of
-    # odom_lidar: transform_fusion owns map -> odom_lidar so it cannot also be
-    # odom_lidar's parent, but the costmaps and collision monitor in
-    # nav2_params_fastlio_loc.yaml require odom (raw odom_lidar is
+    # /cloud_registered in the 'lio_init' frame; lio_map_odom_bridge closes
+    # lio_init -> base_footprint. 'odom' (leveled) is published as a CHILD of
+    # lio_init: transform_fusion owns map -> lio_init so it cannot also be
+    # lio_init's parent, but the costmaps and collision monitor in
+    # nav2_params_fastlio_loc.yaml require odom (raw lio_init is
     # backend-native and not gravity-aligned).
     point_lio_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
@@ -152,7 +159,7 @@ def generate_launch_description():
             'level_frame_as_child': 'true',
         }.items())
 
-    # Registers /cloud_registered (odom frame) against the prior map, producing map -> odom_lidar.
+    # Registers /cloud_registered (odom frame) against the prior map, producing map -> lio_init.
     global_localization = Node(
         package='lio_localization',
         executable='global_localization',
@@ -166,7 +173,7 @@ def generate_launch_description():
             'use_sim_time': use_sim_time,
             'map_pcd': map_pcd,
             'map_frame': 'map',
-            'odom_frame': 'odom_lidar',
+            'odom_frame': 'lio_init',
             'scan_voxel_size': 0.1,
             'fov': 6.28,        # L2 is 360 deg -> ring crop (distance only)
         }],
@@ -185,7 +192,7 @@ def generate_launch_description():
         parameters=[LaunchConfiguration('params_file'), {
             'use_sim_time': use_sim_time,
             'map_frame': 'map',
-            'odom_frame': 'odom_lidar',
+            'odom_frame': 'lio_init',
             'body_frame': 'base_footprint',   # /localization pose is map -> base
             'fusion_rate': 50.0,
         }],

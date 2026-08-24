@@ -6,12 +6,12 @@ adapted to this repo's frame contract. **No Open3D** — the ICP runs on PCL
 (already built/linked across this workspace and clean to install on Jetson).
 
 A LIO backend gives you drift-y odometry; this package registers its live scan
-against a **saved point-cloud map** and publishes the `map → odom_lidar`
+against a **saved point-cloud map** and publishes the `map → lio_init`
 correction, so Nav2 localizes in a fixed, reproducible map frame. **No PGO / no
 RTAB-Map at runtime.**
 
 ```
-map ─(global_localization: ICP vs prior .pcd, ~0.5 Hz)→ odom_lidar
+map ─(global_localization: ICP vs prior .pcd, ~0.5 Hz)→ lio_init
         │  (published as /map_to_odom, rebroadcast as TF @50 Hz by transform_fusion)
         └─(lio_map_odom_bridge)→ base_footprint ─(pepper_sensor_tf, static)→ l2lidar_frame_imu
 ```
@@ -39,7 +39,7 @@ well, which is why both launches default to the same `.pcd`.
 | Node | Does |
 |------|------|
 | `global_localization` | Loads the prior `.pcd`, PCL-ICP-matches `/cloud_registered` to it, publishes `/map_to_odom` (`nav_msgs/Odometry`, frame `map`). C++. |
-| `transform_fusion` | Rebroadcasts the latest `map→odom_lidar` as **TF at 50 Hz** so lookups stay fresh between ICP updates; also republishes fused pose on `/localization/pose`, applying the `<LIO body>→base_footprint` extrinsic to the pose and twist. C++. |
+| `transform_fusion` | Rebroadcasts the latest `map→lio_init` as **TF at 50 Hz** so lookups stay fresh between ICP updates; also republishes fused pose on `/localization/pose`, applying the `<LIO body>→base_footprint` extrinsic to the pose and twist. C++. |
 
 ## 1. Build (no runtime pip deps)
 
@@ -95,9 +95,9 @@ ros2 topic pub --once /initialpose geometry_msgs/msg/PoseWithCovarianceStamped \
   '{header: {frame_id: map}, pose: {pose: {position: {x: 0.0, y: 0.0, z: 0.0}, orientation: {w: 1.0}}}}'
 ```
 
-**What you publish is the ROBOT's pose in `map`**, not a `map → odom_lidar`
+**What you publish is the ROBOT's pose in `map`**, not a `map → lio_init`
 seed. `initial_pose_is_base` (default true) makes `global_localization` compose
-out the current `odom_lidar → base_footprint` itself. This matters: before that
+out the current `lio_init → base_footprint` itself. This matters: before that
 parameter existed, `/initialpose` was implicitly a map→odom seed, which broke
 once saved maps moved into the leveled frame.
 
@@ -116,11 +116,11 @@ is built for exactly this — Fixed Frame `map`, with:
   `base_footprint`: the `<LIO body> → base_footprint` extrinsic is looked up
   from TF once and applied, and the twist is rotated into `base_footprint`
   with its lever-arm term. Withheld (with a throttled warning) until that
-  lookup succeeds — the `map → odom_lidar` TF is unaffected. Pose covariance
+  lookup succeeds — the `map → lio_init` TF is unaffected. Pose covariance
   carries the ICP fitness via `pose_sigma_*` in `config/localization.yaml`; it
   does not model LIO drift between corrections.
 
-Fixed Frame is `map`, not `odom`: the correction lives in `map → odom_lidar`, so
+Fixed Frame is `map`, not `odom`: the correction lives in `map → lio_init`, so
 viewed from `odom` each ICP update lurches the *world* around a stationary
 robot — the same information rendered backwards.
 
@@ -138,11 +138,11 @@ robot — the same information rendered backwards.
 
 See `pepper_slam/FRAMES.md` for the full contract. What matters here:
 
-- This package owns **`map → odom_lidar`**. `odom_lidar` is the LIO's own,
+- This package owns **`map → lio_init`**. `lio_init` is the LIO's own,
   gravity-tilted world frame; `map` is leveled and floor-referenced.
-- Because `odom_lidar` can have only one parent and `transform_fusion` claims
+- Because `lio_init` can have only one parent and `transform_fusion` claims
   it, the leveled `odom` is published as a **child** here
-  (`level_frame_as_child:=true`) rather than as `odom_lidar`'s parent, which is
+  (`level_frame_as_child:=true`) rather than as `lio_init`'s parent, which is
   how the mapping stacks do it. Leveling stays **on** — the costmaps and
   collision monitor need a gravity-aligned, floor-referenced frame.
 - This **replaces** `pgo_map_odom_bridge` for localization runs. Don't run both.
