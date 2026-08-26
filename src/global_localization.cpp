@@ -123,6 +123,7 @@ public:
     // without this conversion starts ICP badly misaligned -- it then converges
     // to a flipped local minimum WITH HIGH FITNESS, which looks like success.
     initial_pose_is_base_ = declare_parameter<bool>("initial_pose_is_base", true);
+    PLANAR_LOCK_ = declare_parameter<bool>("planar_lock", true);
     tf_buffer_ = std::make_shared<tf2_ros::Buffer>(get_clock());
     tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
     MAP_VOXEL_ = declare_parameter<double>("map_voxel_size", 0.4);
@@ -656,6 +657,7 @@ private:
     double f_coarse = 0.0, fitness = 0.0;
     Eigen::Matrix4f transf = registrationAtScale(scan, fov, pose_estimation, 5.0, f_coarse);
     transf = registrationAtScale(scan, fov, transf, 1.0, fitness);
+    if (PLANAR_LOCK_) transf = lockToFloor(transf);
     const double dt_ms = (now() - t0).seconds() * 1e3;
 
     // RViz debug clouds (both in map frame), as upstream publishes them.
@@ -726,7 +728,13 @@ private:
           gated = true;
         }
       }
-      if (!gated) consec_rejects_ = 0;
+      // Reset on EVERY acceptance, gated or not. Resetting only when !gated
+      // left consec_rejects_ stuck above innovation_max_rejects after the first
+      // escape-hatch acceptance, so `consec_rejects_ < INNOV_MAX_REJECTS_`
+      // never held again and every later implausible jump was taken
+      // immediately -- the gate disarmed itself permanently. Observed as
+      // "Accepting ... after 52 consecutive violations" with the limit at 3.
+      consec_rejects_ = 0;
 
       {
         std::lock_guard<std::mutex> lk(mtx_);
@@ -757,6 +765,53 @@ private:
   //
   // Set update_min_d and update_min_a to 0.0 to restore the old purely
   // time-based behaviour.
+  // Hold the robot on the floor plane.
+  //
+  // base_footprint is on the ground by definition, and the map's z=0 IS the
+  // floor (the map is saved in the floor-referenced level frame), so
+  // map -> base_footprint must have z = 0 and no roll or pitch.
+  //
+  // Raw FAST-LIO drifts vertically -- MEASURED 5.13 m over one 1959 s run on
+  // slam_20260823_merged. Once that drift exceeds max_corr_dist the scan can no
+  // longer find correspondences in the prior at all: fitness collapses, the
+  // innovation gate is overrun, and the pose diverges for good. MEASURED on
+  // that bag: tracking held to 0.5 m for 240 s, then z crossed 1.0 m
+  // (== max_corr_dist) and the error ran to 20-30 m and never recovered.
+  //
+  // The projection is applied to the OUTPUT pose, not to the correction: that
+  // way map -> odom stays free to absorb however much the odometry has drifted,
+  // while none of that drift is allowed to reach the robot's pose. Constraining
+  // the correction itself would do the opposite -- forbid it from cancelling
+  // the drift.
+  Eigen::Matrix4f lockToFloor(const Eigen::Matrix4f &T_map_odom)
+  {
+    Eigen::Matrix4f m_odom_base = Eigen::Matrix4f::Identity();
+    try {
+      auto tf = tf_buffer_->lookupTransform(odom_frame_, base_frame_,
+                                            tf2::TimePointZero);
+      Eigen::Quaternionf q(tf.transform.rotation.w, tf.transform.rotation.x,
+                           tf.transform.rotation.y, tf.transform.rotation.z);
+      m_odom_base.block<3, 3>(0, 0) = q.toRotationMatrix();
+      m_odom_base(0, 3) = static_cast<float>(tf.transform.translation.x);
+      m_odom_base(1, 3) = static_cast<float>(tf.transform.translation.y);
+      m_odom_base(2, 3) = static_cast<float>(tf.transform.translation.z);
+    } catch (const tf2::TransformException &ex) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+          "planar_lock: no %s -> %s yet (%s); correction left unconstrained.",
+          odom_frame_.c_str(), base_frame_.c_str(), ex.what());
+      return T_map_odom;
+    }
+    const Eigen::Matrix4f m_map_base = T_map_odom * m_odom_base;
+    const float yaw = std::atan2(m_map_base(1, 0), m_map_base(0, 0));
+    Eigen::Matrix4f flat = Eigen::Matrix4f::Identity();
+    flat(0, 0) = std::cos(yaw);  flat(0, 1) = -std::sin(yaw);
+    flat(1, 0) = std::sin(yaw);  flat(1, 1) =  std::cos(yaw);
+    flat(0, 3) = m_map_base(0, 3);
+    flat(1, 3) = m_map_base(1, 3);
+    flat(2, 3) = 0.0f;                 // base_footprint sits ON the floor
+    return flat * m_odom_base.inverse();
+  }
+
   void locLoop()
   {
     const auto period = std::chrono::duration<double>(1.0 / FREQ_);
@@ -988,6 +1043,7 @@ private:
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr srv_relocalize_;
   rclcpp::TimerBase::SharedPtr auto_init_timer_;
   bool initial_pose_is_base_{true};
+  bool PLANAR_LOCK_{true};
   std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
   std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
   double MAP_VOXEL_, SCAN_VOXEL_, FREQ_, LOCALIZATION_TH_, FOV_, FOV_FAR_;
