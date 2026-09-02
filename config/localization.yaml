@@ -103,6 +103,15 @@
     # dominant added cost of point-to-plane.
     normal_k: 10
 
+    # NOTE: an out-of-plane (z/roll/pitch) ICP constraint lived here until
+    # 2026-09-02. It was removed because it fought planar_lock: that holds
+    # map -> base_footprint on the floor by letting map -> odom absorb
+    # FAST-LIO's vertical drift, while this clamped map -> odom to a frozen
+    # anchor, so past out_of_plane_z_margin of drift every ICP seed was
+    # dragged off and correspondences collapsed. planar_lock (declared in
+    # global_localization.cpp, default true) is now the single owner of the
+    # floor constraint.
+
     # --- plausibility (innovation gate) --------------------------------------
     # Fitness alone cannot separate a true lock from a confident WRONG one. In a
     # corridor the ICP cost surface is nearly flat along the corridor axis, so
@@ -156,6 +165,32 @@
                                     # is noise, several in a row are the world.
                                     # Too low waves a corridor slide through; too
                                     # high makes real recovery slow.
+
+    # YAW counterpart of the gate above. Fitness cannot separate a correct yaw
+    # from a plausible-looking WRONG one either -- a symmetric hallway matched
+    # backwards still lands every point on a wall. Same shape, mirrored onto
+    # rotation: budget scales with how much the robot has actually YAWED since
+    # the last accepted correction, not with distance travelled, because a
+    # robot spinning in place (plausible on Pepper's omni base) accumulates
+    # yaw-only drift that a distance-based budget would gate to zero.
+    #
+    # Shares consec_rejects_/innovation_max_rejects above with the translation
+    # gate: a violation of EITHER axis counts toward the same escape hatch, so
+    # there is only one "how many violations before this is a real
+    # relocalization" knob to tune, not two.
+    #
+    # UNTESTED as of 2026-08-31 -- both values below are physically-reasoned
+    # placeholders (yaw drift rate set higher than translation's 0.001 because
+    # yaw is documented elsewhere as FAST-LIO's weakest axis), not measured
+    # against this workspace's bags. Re-run the same 60 s-window measurement
+    # process used for the translation gate above before trusting these; watch
+    # the reject-log lines for which axis (m vs deg) is actually triggering.
+    yaw_drift_rate: 0.02        # unitless fraction of yaw rotated since the
+                                # last accepted correction (translation's
+                                # odom_drift_rate is 0.001 of distance)
+    innovation_yaw_min: 0.05    # radians (~2.9 deg). Floor, so a correction
+                                # taken at a standstill (or pure translation,
+                                # zero net yaw) does not get a zero yaw budget.
 
     # --- acceptance ---------------------------------------------------------
     # Minimum inlier-ratio fitness to accept a match and publish a correction.

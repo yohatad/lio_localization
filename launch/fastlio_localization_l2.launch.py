@@ -58,7 +58,7 @@ def generate_launch_description():
 
     declare_map_pcd_cmd = DeclareLaunchArgument(
         'map_pcd',
-        default_value=os.path.join(nav_share, 'map', 'pepper_map_lc.pcd'),
+        default_value=os.path.join(nav_share, 'pcd', 'pepper_map_lc.pcd'),
         description='Prior map .pcd to localize against (the loop-closed PGO map).'
     )
     # Enables SEEDLESS localization. Without it the node can only start from a
@@ -70,7 +70,7 @@ def generate_launch_description():
     # grid over free space. Also what /relocalize searches.
     declare_kf_poses_cmd = DeclareLaunchArgument(
         'keyframe_poses',
-        default_value=os.path.join(nav_share, 'map', 'pepper_map_lc_poses.txt'),
+        default_value=os.path.join(nav_share, 'pcd', 'pepper_map_lc_poses.txt'),
         description='KITTI-format keyframe poses from the mapping run, used as '
                     'candidates for global localization and /relocalize. Empty '
                     'disables both (manual /initialpose only). Must come from '
@@ -127,7 +127,7 @@ def generate_launch_description():
     # use_sim_time so it cannot be forgotten -- which matters now that the
     # default config is l2_rsimu.yaml, whose body frame is
     # camera_imu_optical_frame. Under the 'mount' default that frame is never
-    # published on a bag (no driver), so lio_map_odom_bridge cannot close
+    # published on a bag (no driver), so lio_odom_bridge cannot close
     # odom -> base_footprint and the tree comes up in two halves.
     sensor_tf_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
@@ -135,7 +135,7 @@ def generate_launch_description():
         launch_arguments={'use_sim_time': use_sim_time}.items())
 
     # FAST-LIO odometry ONLY (no PGO). Publishes /Odometry + /cloud_registered
-    # in the 'lio_init' frame; lio_map_odom_bridge closes
+    # in the 'lio_init' frame; lio_odom_bridge closes
     # lio_init -> base_footprint.
     #
     # 2026-08-22: config_file was HARDCODED to l2.yaml, i.e. the L2's own IMU,

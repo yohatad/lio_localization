@@ -13,7 +13,7 @@ RTAB-Map at runtime.**
 ```
 map ─(global_localization: ICP vs prior .pcd, ~0.5 Hz)→ lio_init
         │  (published as /map_to_odom, rebroadcast as TF @50 Hz by transform_fusion)
-        └─(lio_map_odom_bridge)→ base_footprint ─(pepper_sensor_tf, static)→ l2lidar_frame_imu
+        └─(lio_odom_bridge)→ base_footprint ─(pepper_sensor_tf, static)→ l2lidar_frame_imu
 ```
 
 ## Either backend

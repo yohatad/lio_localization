@@ -93,7 +93,7 @@ def generate_launch_description():
 
     declare_map_pcd_cmd = DeclareLaunchArgument(
         'map_pcd',
-        default_value=os.path.join(nav_share, 'map', 'pepper_map_lc.pcd'),
+        default_value=os.path.join(nav_share, 'pcd', 'pepper_map_lc.pcd'),
         description='Prior map .pcd to localize against (the loop-closed PGO map). '
                     'Backend-agnostic geometry -- a FAST-LIO-built map is fine here.'
     )
@@ -141,7 +141,7 @@ def generate_launch_description():
         launch_arguments={'use_sim_time': use_sim_time}.items())
 
     # Point-LIO odometry ONLY (no PGO). Publishes /aft_mapped_to_init +
-    # /cloud_registered in the 'lio_init' frame; lio_map_odom_bridge closes
+    # /cloud_registered in the 'lio_init' frame; lio_odom_bridge closes
     # lio_init -> base_footprint. 'odom' (leveled) is published as a CHILD of
     # lio_init: transform_fusion owns map -> lio_init so it cannot also be
     # lio_init's parent, but the costmaps and collision monitor in

@@ -27,7 +27,7 @@
 // This workspace sets publish.map_frame:="lio_init" (see FAST_LIO/config/
 // l2.yaml), naming that frame for what it is: the LIO's native, gravity-tilted
 // odometry frame. It must NOT be plain 'odom' -- that name now belongs to the
-// leveled, floor-referenced frame published by lio_map_odom_bridge, and having
+// leveled, floor-referenced frame published by lio_odom_bridge, and having
 // the tilted output claim it is exactly the bug that saved a 90-deg-tilted map.
 //
 // So this node broadcasts map -> lio_init; both frames are parameterised

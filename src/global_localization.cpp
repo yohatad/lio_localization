@@ -24,6 +24,7 @@
 
 #include <atomic>
 #include <cmath>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -46,7 +47,8 @@
 #include <pcl/point_types.h>
 #include <pcl/io/pcd_io.h>
 #include <pcl/filters/voxel_grid.h>
-#include <pcl/registration/icp.h>
+#include <pcl/correspondence.h>
+#include <pcl/registration/transformation_estimation_svd.h>
 #include <pcl/registration/transformation_estimation_point_to_plane_lls.h>
 #include <pcl/features/normal_3d_omp.h>
 #include <pcl/kdtree/kdtree_flann.h>
@@ -98,6 +100,22 @@ void voxel(const Cloud::ConstPtr &in, Cloud::Ptr &out, double leaf)
   vg.setInputCloud(in);
   vg.setLeafSize(leaf, leaf, leaf);
   vg.filter(*out);
+}
+
+// ZYX (yaw-pitch-roll) Euler decomposition, REP-103 axes (x fwd, y left, z up).
+void matToRPY(const Eigen::Matrix3f &R, float &roll, float &pitch, float &yaw)
+{
+  pitch = std::asin(std::clamp(-R(2, 0), -1.0f, 1.0f));
+  if (std::abs(R(2, 0)) < 0.9999f) {
+    roll = std::atan2(R(2, 1), R(2, 2));
+    yaw = std::atan2(R(1, 0), R(0, 0));
+  } else {
+    // Gimbal lock (pitch ~= +-90 deg): roll/yaw not independently observable.
+    // Not expected for a wheeled robot's own pose, but the yaw innovation
+    // gate needs this to be well-defined regardless.
+    roll = std::atan2(-R(1, 2), R(1, 1));
+    yaw = 0.0f;
+  }
 }
 
 }  // namespace
@@ -156,8 +174,21 @@ public:
     // Consecutive violations before the gate yields. Too low and a corridor
     // slide is waved through; too high and real relocalization is slow.
     INNOV_MAX_REJECTS_ = declare_parameter<int>("innovation_max_rejects", 3);
+    // Yaw counterpart of the gate above: fitness cannot separate a correct
+    // yaw from a plausible-looking wrong one either (a symmetric hallway
+    // matched backwards still lands every point on a wall). Same shape as
+    // the translation gate, mirrored onto rotation: budget scales with how
+    // much the robot has actually YAWED since the last accepted correction,
+    // not with how far it moved -- a robot spinning in place accumulates
+    // yaw-only drift, and this must not be gated to zero just because
+    // d_travel (translation) stayed near zero. Shares consec_rejects_ and
+    // INNOV_MAX_REJECTS_ with the translation gate: a violation of EITHER
+    // counts, so the same escape hatch covers both.
+    YAW_DRIFT_RATE_ = declare_parameter<double>("yaw_drift_rate", 0.02);
+    INNOV_YAW_MIN_ = declare_parameter<double>("innovation_yaw_min", 0.05);
     POINT_TO_PLANE_ = declare_parameter<bool>("point_to_plane", false);
     NORMAL_K_ = declare_parameter<int>("normal_k", 10);
+
     UPDATE_MIN_D_ = declare_parameter<double>("update_min_d", 0.25);
     UPDATE_MIN_A_ = declare_parameter<double>("update_min_a", 0.2);
     FOV_ = declare_parameter<double>("fov", 6.28);        // >pi -> ring lidar
@@ -182,6 +213,14 @@ public:
     GLOBAL_TOP_K_ = declare_parameter<int>("global_top_k", 5);
     GLOBAL_COARSE_ITERS_ = declare_parameter<int>("global_coarse_iterations", 6);
     GLOBAL_COARSE_SCALE_ = declare_parameter<double>("global_coarse_scale", 5.0);
+    // Minimum separation (metres) between two verified candidates for them to
+    // count as genuinely DIFFERENT places rather than yaw-bin/keyframe-
+    // spacing duplicates of the same lock. See the ambiguity gate in
+    // globalSearch(): if two+ candidates this far apart BOTH clear
+    // localization_th, fitness cannot tell which is real (self-similar/
+    // repetitive geometry -- corridors, matching rooms), and the search
+    // refuses to guess rather than confidently pick the wrong one.
+    GLOBAL_AMBIGUITY_DIST_ = declare_parameter<double>("global_ambiguity_dist", 1.0);
     // Off by default: a search that locks onto the wrong place silently is
     // worse than one that waits to be asked. Turn on for unattended bringup,
     // once you trust the acceptance gate on your map.
@@ -201,6 +240,21 @@ public:
                 "Prior map: %zu pts (voxel %.2f). Set an initial pose in RViz "
                 "(2D Pose Estimate -> /initialpose).",
                 global_map_->size(), MAP_VOXEL_);
+
+    // Spatial index for cropMapInFov: a radius query against this replaces
+    // transforming + linearly filtering the WHOLE prior map on every call.
+    // That was the dominant cost of the seedless global search, which calls
+    // cropMapInFov once per (candidate x yaw-bin) hypothesis -- potentially
+    // hundreds of times per search. Horizontal-only (z zeroed) because the
+    // crop itself is a horizontal-distance filter around the robot's
+    // position; see cropMapInFov for why that is a safe approximation here.
+    global_map_xy_.reset(new Cloud);
+    global_map_xy_->reserve(global_map_->size());
+    for (const auto &p : global_map_->points) {
+      global_map_xy_->push_back(PointT(p.x, p.y, 0.0f));
+    }
+    map_index_.reset(new pcl::KdTreeFLANN<PointT>);
+    map_index_->setInputCloud(global_map_xy_);
 
     pub_map_to_odom_ = create_publisher<nav_msgs::msg::Odometry>("/map_to_odom", 1);
     pub_submap_ = create_publisher<sensor_msgs::msg::PointCloud2>("/submap", 1);
@@ -390,120 +444,134 @@ private:
     return static_cast<double>(inliers) / static_cast<double>(aligned.size());
   }
 
-  // Point-to-plane ICP. Minimises distance from each scan point to the PLANE
-  // through its map neighbour, instead of to the neighbour itself.
+  // Manually-driven ICP: correspondences -> closed-form transform update ->
+  // repeat. Hand-rolled rather than pcl::IterativeClosestPoint::align() so
+  // the per-iteration state is visible here; the result is the same
+  // unconstrained SE(3) solve PCL would do.
   //
-  // WHY IT SHOULD WIN HERE: point-to-point forces a one-to-one pairing, so on a
-  // large flat wall it pulls the solution toward whichever arbitrary map point
-  // happened to be nearest -- the "spurious correspondences on flat walls"
-  // effect already documented against map_voxel_size, and the mechanism behind
-  // the ~423 mm of measured zero-mean jitter. Point-to-plane leaves the scan
-  // free to SLIDE along a surface at no cost and only penalises motion INTO or
-  // OUT OF it, which is the correct constraint from a plane observation and
-  // exactly the geometry of an indoor environment.
+  // The out-of-plane (z/roll/pitch) constraint that used to run inside this
+  // loop was REMOVED 2026-09-02. It clamped map -> odom toward a frozen
+  // anchor, but planar_lock/lockToFloor deliberately lets map -> odom absorb
+  // FAST-LIO's unbounded vertical drift (MEASURED 5.16 m over one 1959 s
+  // run) so that map -> base_footprint stays on the floor. The two therefore
+  // fought: once drift exceeded out_of_plane_z_margin the clamp dragged each
+  // new ICP seed back by (drift - margin), and past max_corr_dist the scan
+  // stopped finding correspondences at all -- exactly the divergence
+  // planar_lock was written to prevent. lockToFloor is now the single owner
+  // of the floor constraint; it applies it in the map -> base frame, where
+  // the constraint physically belongs.
   //
-  // COST: normals must be estimated on the cropped map every call. That is the
-  // dominant added expense, so normal_k is kept small; the crop is already
-  // bounded by fov_far.
-  Eigen::Matrix4f registrationPointToPlane(const Cloud::Ptr &scan_ds,
-                                           const Cloud::Ptr &map_ds,
-                                           const Eigen::Matrix4f &guess,
-                                           double scale, double &fitness_out,
-                                           int iters)
+  // Point-to-plane (POINT_TO_PLANE_): minimises distance from each scan point
+  // to the PLANE through its map neighbour instead of to the neighbour
+  // itself. WHY IT CAN STILL HELP EVEN WITH THE CLAMP: point-to-point forces
+  // a one-to-one pairing, so on a large flat wall it pulls the solution
+  // toward whichever arbitrary map point happened to be nearest -- the
+  // "spurious correspondences on flat walls" effect, and the mechanism
+  // behind ~423 mm of measured zero-mean jitter upstream. Point-to-plane
+  // leaves the scan free to SLIDE along a surface at no cost and only
+  // penalises motion INTO or OUT OF it. COST: normals must be estimated on
+  // the cropped map every call, so normal_k is kept small.
+  Eigen::Matrix4f registrationICP(const Cloud::Ptr &scan_ds,
+                                          const Cloud::Ptr &map_ds,
+                                          const Eigen::Matrix4f &guess,
+                                          double max_corr_dist, int iters,
+                                          double scale, double &fitness_out)
   {
-    // Too few points to fit planes through: fall back rather than return a
-    // garbage transform. A sparse crop is exactly where normals are worst.
+    Eigen::Matrix4f T = guess;
+
+    // Too sparse to trust a fit (map edge, aggressive crop): report the seed
+    // as-is rather than run normal estimation / an SVD solve on near-nothing.
     if (map_ds->size() < 10 || scan_ds->size() < 10) {
-      pcl::IterativeClosestPoint<PointT, PointT> icp;
-      icp.setInputSource(scan_ds);
-      icp.setInputTarget(map_ds);
-      icp.setMaxCorrespondenceDistance(MAX_CORR_DIST_ * scale);
-      icp.setMaximumIterations(iters > 0 ? iters : ICP_ITERS_);
-      Cloud aligned;
-      icp.align(aligned, guess);
-      fitness_out = inlierFitness(aligned, map_ds, MAX_CORR_DIST_ * scale);
-      return icp.getFinalTransformation();
+      Cloud aligned0;
+      pcl::transformPointCloud(*scan_ds, aligned0, T);
+      fitness_out = inlierFitness(aligned0, map_ds, max_corr_dist);
+      return T;
     }
 
-    // --- normals on the target -------------------------------------------
-    pcl::NormalEstimationOMP<PointT, pcl::Normal> ne;
-    ne.setInputCloud(map_ds);
-    ne.setSearchMethod(pcl::search::KdTree<PointT>::Ptr(
-        new pcl::search::KdTree<PointT>()));
-    ne.setKSearch(NORMAL_K_);
-    pcl::PointCloud<pcl::Normal>::Ptr normals(new pcl::PointCloud<pcl::Normal>);
-    ne.compute(*normals);
+    pcl::KdTreeFLANN<PointT> kdtree;
+    kdtree.setInputCloud(map_ds);
 
-    CloudN::Ptr tgt(new CloudN);
-    tgt->reserve(map_ds->size());
-    for (size_t i = 0; i < map_ds->size(); ++i) {
-      // Drop points whose normal did not resolve. Feeding a NaN normal into
-      // the LLS solver poisons the whole least-squares system, so a handful of
-      // bad points would corrupt an otherwise good match.
-      if (!std::isfinite(normals->points[i].normal_x) ||
-          !std::isfinite(normals->points[i].normal_y) ||
-          !std::isfinite(normals->points[i].normal_z)) {
-        continue;
+    // Point-to-plane target: normals on the (static, per-call) cropped map,
+    // computed once and reused every iteration -- only the scan's pose moves.
+    bool use_p2p_plane = false;
+    CloudN::Ptr tgt_n;
+    if (POINT_TO_PLANE_) {
+      pcl::NormalEstimationOMP<PointT, pcl::Normal> ne;
+      ne.setInputCloud(map_ds);
+      ne.setSearchMethod(pcl::search::KdTree<PointT>::Ptr(
+          new pcl::search::KdTree<PointT>()));
+      ne.setKSearch(NORMAL_K_);
+      pcl::PointCloud<pcl::Normal>::Ptr normals(new pcl::PointCloud<pcl::Normal>);
+      ne.compute(*normals);
+
+      tgt_n.reset(new CloudN);
+      tgt_n->reserve(map_ds->size());
+      for (size_t i = 0; i < map_ds->size(); ++i) {
+        // Drop points whose normal did not resolve: a NaN normal would
+        // poison the whole LLS solve.
+        if (!std::isfinite(normals->points[i].normal_x) ||
+            !std::isfinite(normals->points[i].normal_y) ||
+            !std::isfinite(normals->points[i].normal_z)) {
+          continue;
+        }
+        PointN p;
+        p.x = map_ds->points[i].x; p.y = map_ds->points[i].y; p.z = map_ds->points[i].z;
+        p.normal_x = normals->points[i].normal_x;
+        p.normal_y = normals->points[i].normal_y;
+        p.normal_z = normals->points[i].normal_z;
+        tgt_n->push_back(p);
       }
-      PointN p;
-      p.x = map_ds->points[i].x;
-      p.y = map_ds->points[i].y;
-      p.z = map_ds->points[i].z;
-      p.normal_x = normals->points[i].normal_x;
-      p.normal_y = normals->points[i].normal_y;
-      p.normal_z = normals->points[i].normal_z;
-      tgt->push_back(p);
-    }
-    if (tgt->size() < 10) {   // nearly everything failed: fall back
-      pcl::IterativeClosestPoint<PointT, PointT> icp;
-      icp.setInputSource(scan_ds);
-      icp.setInputTarget(map_ds);
-      icp.setMaxCorrespondenceDistance(MAX_CORR_DIST_ * scale);
-      icp.setMaximumIterations(iters > 0 ? iters : ICP_ITERS_);
-      Cloud aligned;
-      icp.align(aligned, guess);
-      fitness_out = inlierFitness(aligned, map_ds, MAX_CORR_DIST_ * scale);
-      return icp.getFinalTransformation();
+      use_p2p_plane = tgt_n->size() >= 10;  // else: point-to-point below
     }
 
-    // Source carries no normals: PointToPlaneLLS reads the TARGET's, and the
-    // scan is far too sparse for its own normals to be trustworthy anyway.
-    CloudN::Ptr src(new CloudN);
-    src->reserve(scan_ds->size());
-    for (const auto &q : scan_ds->points) {
-      PointN p;
-      p.x = q.x; p.y = q.y; p.z = q.z;
-      p.normal_x = p.normal_y = p.normal_z = 0.0f;
-      src->push_back(p);
+    const double r2 = max_corr_dist * max_corr_dist;
+
+    for (int it = 0; it < iters; ++it) {
+      Cloud::Ptr transformed(new Cloud);
+      pcl::transformPointCloud(*scan_ds, *transformed, T);
+
+      pcl::Correspondences corr;
+      corr.reserve(transformed->size());
+      std::vector<int> idx(1);
+      std::vector<float> d2(1);
+      for (size_t i = 0; i < transformed->size(); ++i) {
+        if (kdtree.nearestKSearch(transformed->points[i], 1, idx, d2) > 0 &&
+            d2[0] <= r2) {
+          corr.push_back(pcl::Correspondence(static_cast<int>(i), idx[0], d2[0]));
+        }
+      }
+      if (corr.size() < 6) break;  // too few constraints to trust a 6-DOF solve
+
+      Eigen::Matrix4f T_step = Eigen::Matrix4f::Identity();
+      if (use_p2p_plane) {
+        // Source carries no normals: PointToPlaneLLS reads the TARGET's, and
+        // the scan is far too sparse for its own normals to be trustworthy.
+        CloudN src_n;
+        src_n.reserve(transformed->size());
+        for (const auto &q : transformed->points) {
+          PointN p;
+          p.x = q.x; p.y = q.y; p.z = q.z;
+          p.normal_x = p.normal_y = p.normal_z = 0.0f;
+          src_n.push_back(p);
+        }
+        pcl::registration::TransformationEstimationPointToPlaneLLS<PointN, PointN> est;
+        est.estimateRigidTransformation(src_n, *tgt_n, corr, T_step);
+      } else {
+        pcl::registration::TransformationEstimationSVD<PointT, PointT> est;
+        est.estimateRigidTransformation(*transformed, *map_ds, corr, T_step);
+      }
+
+      // T_step maps the CURRENT `transformed` cloud onto the target, so the
+      // new total transform composes onto T rather than replacing it.
+      T = T_step * T;
     }
 
-    // Plain IterativeClosestPoint with an explicit point-to-plane estimator,
-    // NOT IterativeClosestPointWithNormals: the latter also rejects
-    // correspondences on normal agreement, which would compare against the
-    // zeroed source normals above and throw away good pairs.
-    pcl::IterativeClosestPoint<PointN, PointN> icp;
-    icp.setTransformationEstimation(
-        pcl::registration::TransformationEstimationPointToPlaneLLS<
-            PointN, PointN>::Ptr(
-            new pcl::registration::TransformationEstimationPointToPlaneLLS<
-                PointN, PointN>()));
-    icp.setInputSource(src);
-    icp.setInputTarget(tgt);
-    icp.setMaxCorrespondenceDistance(MAX_CORR_DIST_ * scale);
-    icp.setMaximumIterations(iters > 0 ? iters : ICP_ITERS_);
-
-    CloudN aligned_n;
-    icp.align(aligned_n, guess);
-    const Eigen::Matrix4f T = icp.getFinalTransformation();
-
-    // Fitness stays the SAME inlier-ratio metric as point-to-point, measured
-    // over the same radius. It has to: localization_th is calibrated against
-    // it, and changing the metric under the gate would silently re-tune the
-    // acceptance threshold.
     Cloud aligned;
-    aligned.reserve(aligned_n.size());
-    for (const auto &q : aligned_n.points) aligned.push_back(PointT(q.x, q.y, q.z));
-    fitness_out = inlierFitness(aligned, map_ds, MAX_CORR_DIST_ * scale);
+    pcl::transformPointCloud(*scan_ds, aligned, T);
+    // Same inlier-ratio metric and radius as always: localization_th is
+    // calibrated against it, and changing the metric under the gate would
+    // silently re-tune the acceptance threshold.
+    fitness_out = inlierFitness(aligned, map_ds, max_corr_dist);
     return T;
   }
 
@@ -516,61 +584,58 @@ private:
     voxel(scan, scan_ds, SCAN_VOXEL_ * scale);
     voxel(map, map_ds, MAP_VOXEL_ * scale);
 
-    if (POINT_TO_PLANE_) {
-      return registrationPointToPlane(scan_ds, map_ds, guess, scale,
-                                      fitness_out, iters);
-    }
-
-    pcl::IterativeClosestPoint<PointT, PointT> icp;
-    icp.setInputSource(scan_ds);
-    icp.setInputTarget(map_ds);
-    // Upstream hardcoded 1.0 m at the fine scale, which is very loose: a scan
-    // point pairs with a map point up to a metre away. On the large flat walls
-    // this rig sees, that is exactly what lets the solution SLIDE along a
-    // surface while every point still finds a partner -- measured as ~423 mm
-    // of zero-mean jitter in map->odom (net/sum ratio 0.09, i.e. 91% of the
-    // motion cancelled out) at fitness 0.98. Tightening it penalises sliding.
-    icp.setMaxCorrespondenceDistance(MAX_CORR_DIST_ * scale);
-    // iters < 0 means "use the configured count". The global search overrides it
-    // with a much smaller number: that pass only RANKS hypotheses, and running
-    // 40 iterations on each of several hundred is what would make a seedless
-    // search take minutes instead of seconds.
-    icp.setMaximumIterations(iters > 0 ? iters : ICP_ITERS_);
-
-    Cloud aligned;
-    icp.align(aligned, guess);
-    Eigen::Matrix4f T = icp.getFinalTransformation();
-    // Same radius as the solver, deliberately: fitness then means "fraction of
-    // points that actually aligned", not "fraction within a metre of anything".
-    fitness_out = inlierFitness(aligned, map_ds, MAX_CORR_DIST_ * scale);
-    return T;
+    // iters < 0 means "use the configured count". The global search overrides
+    // it with a much smaller number: that pass only RANKS hypotheses, and
+    // running 40 iterations on each of several hundred is what would make a
+    // seedless search take minutes instead of seconds.
+    return registrationICP(scan_ds, map_ds, guess, MAX_CORR_DIST_ * scale,
+                                   iters > 0 ? iters : ICP_ITERS_, scale, fitness_out);
   }
 
   // Crop the prior map to the sensor FOV around the current estimate. Returns
   // points in the MAP frame (target for ICP). FOV > pi => 360 ring (distance).
+  //
+  // SPATIAL-INDEXED: broad-phase is a radius query against map_index_ (built
+  // once at load, see the constructor), not a transform + linear scan of the
+  // WHOLE map -- that was the dominant cost of the seedless global search,
+  // which calls this once per (candidate x yaw-bin) hypothesis. The query
+  // uses horizontal (map-frame x/y, z=0) distance from the robot's position,
+  // which is what "ring" always meant (a ground-plane range), and is a safe
+  // stand-in for true base-frame planar distance: planar_lock holds the
+  // published pose level, so the two are identical for a perfectly level
+  // base and diverge only by the (small, bounded) mount tilt.
+  //
+  // For a sector FOV, the radius query is a conservative superset (a sector
+  // is a subset of its bounding disc), so a cheap narrow-phase transform +
+  // angle filter still runs -- but only over that already-small result, not
+  // the whole map.
   Cloud::Ptr cropMapInFov(const Eigen::Matrix4f &pose_est,
                           const geometry_msgs::msg::Pose &odom_pose)
   {
-    Eigen::Matrix4f T_map_base = pose_est * poseToMat(odom_pose);
-    Eigen::Matrix4f T_base_map = T_map_base.inverse();
+    const Eigen::Matrix4f T_map_base = pose_est * poseToMat(odom_pose);
 
-    Cloud::Ptr in_base(new Cloud);
-    pcl::transformPointCloud(*global_map_, *in_base, T_base_map);
+    PointT query(T_map_base(0, 3), T_map_base(1, 3), 0.0f);
+    std::vector<int> idx;
+    std::vector<float> d2;
+    map_index_->radiusSearch(query, FOV_FAR_, idx, d2);
 
     Cloud::Ptr fov(new Cloud);
-    fov->reserve(in_base->size());
-    const double far2 = FOV_FAR_ * FOV_FAR_;
-    const bool ring = FOV_ > 3.14;
-    for (size_t i = 0; i < in_base->size(); ++i) {
-      const auto &p = in_base->points[i];
-      bool keep;
-      if (ring) {
-        keep = (p.x * p.x + p.y * p.y) < far2;
-      } else {
-        double ang = std::abs(std::atan2(p.y, p.x));
-        keep = (p.x > 0.0) && (p.x < FOV_FAR_) && (ang < FOV_ / 2.0);
+    fov->reserve(idx.size());
+
+    if (FOV_ > 3.14) {   // ring: the radius query above already IS the answer
+      for (int i : idx) fov->push_back(global_map_->points[i]);
+      return fov;
+    }
+
+    const Eigen::Matrix4f T_base_map = T_map_base.inverse();
+    for (int i : idx) {
+      const auto &mp = global_map_->points[i];
+      const Eigen::Vector4f pb =
+          T_base_map * Eigen::Vector4f(mp.x, mp.y, mp.z, 1.0f);
+      const double ang = std::abs(std::atan2(pb.y(), pb.x()));
+      if (pb.x() > 0.0f && pb.x() < FOV_FAR_ && ang < FOV_ / 2.0) {
+        fov->push_back(mp);  // keep in MAP frame
       }
-      if (keep) fov->push_back(global_map_->points[i]);  // keep in MAP frame
     }
     return fov;
   }
@@ -690,50 +755,77 @@ private:
       // violations are counted, and once innovation_max_rejects of them agree
       // that the pose has moved, the correction is accepted. One outlier is
       // noise; several in a row are the world.
-      bool gated = false;
       if (INNOV_ENABLED_ && !from_search && have_last_accept_) {
         Eigen::Matrix4f prev;
         {
           std::lock_guard<std::mutex> lk(mtx_);
           prev = T_map_to_odom_;
         }
-        // How far the ROBOT moved since the last accepted correction, in odom
-        // (continuous by REP-105, and unaffected by our own corrections).
+        // How far the ROBOT moved/turned since the last accepted correction,
+        // in odom (continuous by REP-105, and unaffected by our own
+        // corrections).
         const Eigen::Matrix4f odom_now = poseToMat(odom.pose.pose);
-        const double d_travel =
-            (last_accept_odom_.inverse() * odom_now).block<3, 1>(0, 3).norm();
-        // How much map -> odom is being asked to jump.
+        const Eigen::Matrix4f odom_delta = last_accept_odom_.inverse() * odom_now;
+        const double d_travel = odom_delta.block<3, 1>(0, 3).norm();
+        float travel_roll, travel_pitch, travel_yaw;
+        matToRPY(odom_delta.block<3, 3>(0, 0), travel_roll, travel_pitch, travel_yaw);
+        const double a_travel = std::abs(travel_yaw);
+
+        // How much map -> odom is being asked to jump: translation, and
+        // separately yaw. Kept as two independent checks (not summed into one
+        // scalar) because they have different units and different physical
+        // drift sources -- see the yaw_drift_rate parameter comment.
         const double innovation =
             (transf.block<3, 1>(0, 3) - prev.block<3, 1>(0, 3)).norm();
-        // Budget: drift over that distance, times a safety factor, with a floor
-        // so ICP scatter at a standstill is not gated to zero.
+        float prev_roll, prev_pitch, prev_yaw, new_roll, new_pitch, new_yaw;
+        matToRPY(prev.block<3, 3>(0, 0), prev_roll, prev_pitch, prev_yaw);
+        matToRPY(transf.block<3, 3>(0, 0), new_roll, new_pitch, new_yaw);
+        const double innovation_yaw =
+            std::abs(std::atan2(std::sin(new_yaw - prev_yaw),
+                                std::cos(new_yaw - prev_yaw)));
+
+        // Budget: drift over distance/rotation travelled, times a safety
+        // factor, with a floor so ICP scatter at a standstill is not gated
+        // to zero.
         const double budget =
             std::max(INNOV_MIN_, DRIFT_RATE_ * d_travel * INNOV_SAFETY_);
+        const double budget_yaw =
+            std::max(INNOV_YAW_MIN_, YAW_DRIFT_RATE_ * a_travel * INNOV_SAFETY_);
 
-        if (innovation > budget) {
+        const bool trans_violated = innovation > budget;
+        const bool yaw_violated = innovation_yaw > budget_yaw;
+        if (trans_violated || yaw_violated) {
           ++consec_rejects_;
           if (consec_rejects_ < INNOV_MAX_REJECTS_) {
             RCLCPP_WARN(get_logger(),
                 "REJECTED implausible correction: %.2f m jump after %.2f m "
-                "travelled (budget %.2f m), fitness %.3f. %d/%d consecutive -- "
+                "travelled (budget %.2f m)%s, %.1f deg yaw jump after %.1f deg "
+                "turned (budget %.1f deg)%s, fitness %.3f. %d/%d consecutive -- "
                 "accepting anyway at %d.",
-                innovation, d_travel, budget, fitness,
-                consec_rejects_, INNOV_MAX_REJECTS_, INNOV_MAX_REJECTS_);
+                innovation, d_travel, budget, trans_violated ? " [VIOLATED]" : "",
+                innovation_yaw * 180.0 / M_PI, a_travel * 180.0 / M_PI,
+                budget_yaw * 180.0 / M_PI, yaw_violated ? " [VIOLATED]" : "",
+                fitness, consec_rejects_, INNOV_MAX_REJECTS_, INNOV_MAX_REJECTS_);
             return false;
           }
           RCLCPP_WARN(get_logger(),
-              "Accepting %.2f m correction after %d consecutive violations -- "
-              "treating as a genuine relocalization, not an outlier.",
-              innovation, consec_rejects_);
-          gated = true;
+              "Accepting %.2f m / %.1f deg correction after %d consecutive "
+              "violations -- treating as a genuine relocalization, not an "
+              "outlier.",
+              innovation, innovation_yaw * 180.0 / M_PI, consec_rejects_);
         }
       }
-      // Reset on EVERY acceptance, gated or not. Resetting only when !gated
-      // left consec_rejects_ stuck above innovation_max_rejects after the first
-      // escape-hatch acceptance, so `consec_rejects_ < INNOV_MAX_REJECTS_`
-      // never held again and every later implausible jump was taken
-      // immediately -- the gate disarmed itself permanently. Observed as
-      // "Accepting ... after 52 consecutive violations" with the limit at 3.
+      // Reached only on acceptance (normal pass-through, or the escape
+      // hatch above): a REJECT returns false earlier. BUG FIXED 2026-08-31:
+      // this used to be guarded by `if (!gated)`, so once the escape hatch
+      // fired once, consec_rejects_ never reset and stayed >=
+      // innovation_max_rejects forever -- the gate disarmed itself
+      // permanently for the rest of the run, taking every later implausible
+      // jump immediately. MEASURED on two separate runs: an unbroken chain
+      // of "consecutive violations" (5, 6, 7, ... 14) including a 6.30 m /
+      // 143.3 deg jump on one, and "Accepting ... after 52 consecutive
+      // violations" with the limit at 3 on the other. Reset unconditionally
+      // on every acceptance now, gated or not.
       consec_rejects_ = 0;
 
       {
@@ -943,7 +1035,42 @@ private:
     // The scan arrives in the odom frame. A candidate keyframe pose is where
     // the BASE was in map, so the map->odom guess that would put the robot
     // there is  T_map_odom = T_map_base * T_odom_base^-1.
-    const Eigen::Matrix4f T_odom_base = poseToMat(odom.pose.pose);
+    //
+    // T_odom_base MUST be odom_frame_ -> base_frame_ (e.g. lio_init ->
+    // base_footprint, the ROBOT's pose), NOT odom.pose.pose -- that is
+    // /odom_lio, i.e. odom_frame_ -> the LIO's own body/sensor frame
+    // (camera_imu_optical_frame), a real, non-trivial extrinsic away from
+    // base_footprint (translation AND rotation; see transform_fusion's own
+    // resolved log line for the magnitude). cbInitialPose() a few hundred
+    // lines up already gets this right via the same TF lookup; this used to
+    // take odom.pose.pose directly instead, silently skipping that
+    // extrinsic for every single seedless-search candidate. MEASURED: with
+    // this bug, manually-seeded /initialpose (which goes through
+    // cbInitialPose) tracked cleanly at 0.98-1.0 fitness while the seedless
+    // search kept landing on wrong/ambiguous locks despite every fix to the
+    // registration itself -- because the candidates it was verifying were
+    // never actually where it thought they were.
+    Eigen::Matrix4f T_odom_base;
+    try {
+      auto tf = tf_buffer_->lookupTransform(odom_frame_, base_frame_,
+                                            tf2::TimePointZero,
+                                            tf2::durationFromSec(1.0));
+      Eigen::Quaternionf q(tf.transform.rotation.w, tf.transform.rotation.x,
+                          tf.transform.rotation.y, tf.transform.rotation.z);
+      q.normalize();
+      T_odom_base = Eigen::Matrix4f::Identity();
+      T_odom_base.block<3, 3>(0, 0) = q.toRotationMatrix();
+      T_odom_base(0, 3) = tf.transform.translation.x;
+      T_odom_base(1, 3) = tf.transform.translation.y;
+      T_odom_base(2, 3) = tf.transform.translation.z;
+    } catch (const tf2::TransformException &ex) {
+      RCLCPP_WARN(get_logger(),
+          "No %s -> %s yet (%s); falling back to the raw sensor pose as if "
+          "it were the base -- candidates will be off by the sensor->base "
+          "extrinsic until this TF is available.",
+          odom_frame_.c_str(), base_frame_.c_str(), ex.what());
+      T_odom_base = poseToMat(odom.pose.pose);
+    }
     const Eigen::Matrix4f T_odom_base_inv = T_odom_base.inverse();
 
     Cloud::Ptr scan_coarse(new Cloud);
@@ -990,21 +1117,84 @@ private:
       "best coarse score %.3f, verifying top %d.",
       tried, kf_cands_.size(), bins, (now() - t0).seconds(), scored[0].score, keep);
 
-    // Verify the survivors with the SAME two-stage registration and the SAME
-    // gate used in steady state -- a confident wrong lock is worse than none.
+    // Verify each survivor's FINE-scale fitness first, as a DRY RUN -- same
+    // two-stage registration globalLocalization() uses, but not yet
+    // committed (no T_map_to_odom_/anchor/publish side effects). Necessary
+    // because the COARSE score above cannot be used as an ambiguity signal:
+    // it runs at a deliberately loose (5x) correspondence radius so it
+    // saturates near 1.0 for almost any reasonably-close candidate.
+    // MEASURED: top coarse scores read 0.996-1.000 across unrelated runs on
+    // this map, while the FINE stage is what actually separated a correct
+    // lock (0.98-1.0, stable over time) from a merely plausible one.
+    struct FineResult { int idx; double fitness; Eigen::Matrix4f T; };
+    std::vector<FineResult> passed;
     for (int i = 0; i < keep; ++i) {
       if (!running_) return false;
-      if (globalLocalization(scored[i].T, /*from_search=*/true)) {
-        RCLCPP_INFO(get_logger(),
-          "Global localization SUCCEEDED on hypothesis %d/%d.", i + 1, keep);
-        return true;
+      Cloud::Ptr fov = cropMapInFov(scored[i].T, odom.pose.pose);
+      double f_coarse2 = 0.0;
+      const Eigen::Matrix4f t1 =
+          registrationAtScale(scan, fov, scored[i].T, 5.0, f_coarse2);
+      double f_fine = 0.0;
+      const Eigen::Matrix4f t2 = registrationAtScale(scan, fov, t1, 1.0, f_fine);
+      if (f_fine > LOCALIZATION_TH_) passed.push_back({i, f_fine, t2});
+    }
+
+    if (passed.empty()) {
+      RCLCPP_WARN(get_logger(),
+        "Global localization FAILED: no hypothesis passed localization_th "
+        "(%.2f). The robot may be somewhere the prior map does not cover, or "
+        "the map is stale. Send /initialpose, or call /relocalize again "
+        "after moving.",
+        LOCALIZATION_TH_);
+      return false;
+    }
+
+    // AMBIGUITY GATE: if two+ survivors that are genuinely different PLACES
+    // (see global_ambiguity_dist) both clear the threshold, fitness alone
+    // cannot tell which is real -- the self-similar/repetitive-geometry
+    // failure mode already documented for Scan Context elsewhere in this
+    // codebase, now hitting the seedless search directly. A confident wrong
+    // lock is worse than none: refuse to guess, ask the operator instead.
+    for (size_t a = 0; a < passed.size(); ++a) {
+      for (size_t b = a + 1; b < passed.size(); ++b) {
+        const double d = (passed[a].T.block<3, 1>(0, 3) -
+                          passed[b].T.block<3, 1>(0, 3)).norm();
+        if (d > GLOBAL_AMBIGUITY_DIST_) {
+          RCLCPP_ERROR(get_logger(),
+            "Global localization AMBIGUOUS: %zu of %d candidates cleared "
+            "localization_th (%.2f), including two %.1f m apart (fitness "
+            "%.3f vs %.3f) -- this environment likely has repetitive/self-"
+            "similar geometry fitness cannot disambiguate. Refusing to "
+            "guess; send /initialpose instead.",
+            passed.size(), keep, LOCALIZATION_TH_, d,
+            passed[a].fitness, passed[b].fitness);
+          return false;
+        }
       }
     }
+
+    // Unambiguous: commit the best-fitness survivor through the normal
+    // accept path (innovation gate, anchor, publish -- same as steady state).
+    std::sort(passed.begin(), passed.end(),
+              [](const FineResult &a, const FineResult &b) {
+                return a.fitness > b.fitness;
+              });
+    if (globalLocalization(scored[passed[0].idx].T, /*from_search=*/true)) {
+      RCLCPP_INFO(get_logger(),
+        "Global localization SUCCEEDED on hypothesis %d/%d (fitness %.3f).",
+        passed[0].idx + 1, keep, passed[0].fitness);
+      return true;
+    }
+    // Should not normally be reached: the committed call re-runs the exact
+    // same deterministic registration on the same seed (from_search=true
+    // skips the innovation gate, same as the dry run above), so a dry-run
+    // pass should always commit. Kept as a safety net, not a retry loop --
+    // ambiguity has already been ruled out for THIS scan, so silently
+    // falling through to another candidate here would undermine that check.
     RCLCPP_WARN(get_logger(),
-      "Global localization FAILED: no hypothesis passed localization_th (%.2f). "
-      "The robot may be somewhere the prior map does not cover, or the map is "
-      "stale. Send /initialpose, or call /relocalize again after moving.",
-      LOCALIZATION_TH_);
+      "Global localization FAILED: best candidate (fitness %.3f) did not "
+      "commit. Send /initialpose, or call /relocalize again after moving.",
+      passed[0].fitness);
     return false;
   }
 
@@ -1031,12 +1221,14 @@ private:
   bool INNOV_ENABLED_{true};
   double DRIFT_RATE_{0.001}, INNOV_SAFETY_{10.0}, INNOV_MIN_{0.30};
   int INNOV_MAX_REJECTS_{3};
+  double YAW_DRIFT_RATE_{0.02}, INNOV_YAW_MIN_{0.05};
   Eigen::Matrix4f last_accept_odom_{Eigen::Matrix4f::Identity()};
   bool have_last_accept_{false};
   int consec_rejects_{0};
   int NORMAL_K_{10};
   int GLOBAL_YAW_BINS_{12}, GLOBAL_TOP_K_{5}, GLOBAL_COARSE_ITERS_{6};
   double GLOBAL_COARSE_SCALE_{5.0}, GLOBAL_SPACING_{3.0};
+  double GLOBAL_AMBIGUITY_DIST_{1.0};
   bool AUTO_INIT_{false};
   std::atomic<bool> search_running_{false};
   std::thread search_thread_;
@@ -1053,6 +1245,8 @@ private:
 
   // state
   Cloud::Ptr global_map_;
+  Cloud::Ptr global_map_xy_;                 // global_map_ with z zeroed, for cropMapInFov's radius query
+  pcl::KdTreeFLANN<PointT>::Ptr map_index_;  // spatial index over global_map_xy_, built once at load
   Cloud::Ptr cur_scan_;
   nav_msgs::msg::Odometry::SharedPtr cur_odom_;
   Eigen::Matrix4f T_map_to_odom_;
