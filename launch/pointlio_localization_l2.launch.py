@@ -1,27 +1,17 @@
-# ICP localization against a prior .pcd map, on POINT-LIO odometry -- the
-# Point-LIO equivalent of fastlio_localization_l2.launch.py. See that file for
-# the reasoning behind each piece; this documents only what differs.
+# Prior-map ICP localization on POINT-LIO odometry -- the Point-LIO twin of
+# fastlio_localization_l2.launch.py. That file carries the shared reasoning;
+# this one documents only what differs:
 #
-# WHY A REMAP IS ENOUGH (no C++ changes):
-#   * /cloud_registered  -- Point-LIO publishes this under the IDENTICAL name,
-#     in the same 'odom' frame (its odom_header_frame_id), so global_localization
-#     consumes it unchanged.
-#   * /Odometry          -- hardcoded in BOTH nodes (global_localization.cpp and
-#     transform_fusion.cpp), and Point-LIO publishes /aft_mapped_to_init instead.
-#     A launch-time remap on both nodes covers it. Remapping (not editing the
-#     source) keeps this package usable by either backend at once.
+#   * A remap is all it takes. Point-LIO publishes /cloud_registered under the
+#     identical name and frame, and both localization nodes hardcode
+#     "/Odometry", so remapping that to Point-LIO's topic keeps this package
+#     usable by either backend without touching the C++.
+#   * The prior map is backend-agnostic geometry, so map_pcd and keyframe_poses
+#     default to the SAME artifacts as the FAST-LIO variant. Pass map_pcd:= to
+#     use a Point-LIO-built map instead.
 #
-# THE PRIOR MAP IS BACKEND-AGNOSTIC. map_pcd is just environment geometry, so a
-# map built by the FAST-LIO PGO run localizes Point-LIO perfectly well. The
-# default therefore points at the SAME map as the FAST-LIO variant rather than
-# at pointlio_lc_l2.launch.py's separate save_directory -- one map, either
-# backend. Pass map_pcd:= to use a Point-LIO-built map instead.
-#
-# Usage:
-#   ros2 launch lio_localization pointlio_localization_l2.launch.py
-#   ros2 bag play <bag> --clock --topics /points /imu/data
-#   Then give it an initial guess in RViz (2D Pose Estimate) -- global
-#   localization needs a rough seed before ICP can converge.
+# Runtime tunables live in config/localization.yaml. Seeding: publish
+# /initialpose, call /relocalize, or pass auto_initialize:=true.
 
 import os
 
@@ -37,22 +27,13 @@ from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 
 
-# Point-LIO's odometry topic. Both localization nodes hardcode "/Odometry"
-# (FAST-LIO's name), so every Node below remaps it to this.
-# Point-LIO now remaps its native /aft_mapped_to_init to the shared /odom_lio
-# in mapping_l2lidar_node.launch.py, so localization nodes -- which
-# hardcode "/Odometry" -- are remapped to that instead.
+# mapping_l2lidar_node.launch.py remaps Point-LIO's native /aft_mapped_to_init
+# to this shared name; the nodes below hardcode "/Odometry", so remap to it.
 POINT_LIO_ODOM_TOPIC = '/odom_lio'
 
 
 def _check_map_pcd_exists(context, *args, **kwargs):
-    """Fail at launch time, not deep in global_localization's C++ ctor.
-
-    This is an expected precondition (you need a prior map before you can
-    localize against one), not a bug -- but failing here gives a much more
-    actionable message than the node's runtime exception, including how to
-    actually build the map this launch file expects.
-    """
+    """Fail at launch with an actionable message, not in the node's C++ ctor."""
     path = LaunchConfiguration('map_pcd').perform(context)
     if not os.path.isfile(path):
         raise RuntimeError(
@@ -68,17 +49,10 @@ def _check_map_pcd_exists(context, *args, **kwargs):
 def generate_launch_description():
     point_lio_share = get_package_share_directory('point_lio')
     sensor_tf_share = get_package_share_directory('pepper_slam')
-    # Map artifacts ship with pepper_navigation so map_pcd and keyframe_poses
-    # resolve on ANY machine (the Jetson runs as a different user, so an
-    # absolute /home/<user> default silently does not exist there).
-    #
-    # Deliberately NOT declared as an exec_depend in package.xml: pepper_navigation
-    # already depends on THIS package, so declaring the reverse edge makes colcon
-    # refuse the whole workspace with "Unable to order packages topologically".
-    # The ament index lookup does not need the declaration -- it only needs the
-    # package to be built. Tolerate its absence so this package still launches
-    # standalone; the defaults are then unusable placeholders, and callers
-    # (pepper_nav2_fastlio_loc.launch.py) pass both paths explicitly anyway.
+    # pepper_navigation ships the map artifacts but is deliberately NOT an
+    # exec_depend: it already depends on this package, and the reverse edge
+    # makes colcon refuse the workspace. Tolerate its absence so this package
+    # still launches standalone.
     try:
         nav_share = get_package_share_directory('pepper_navigation')
     except PackageNotFoundError:
@@ -96,19 +70,16 @@ def generate_launch_description():
         description='Prior map .pcd to localize against (the loop-closed PGO map). '
                     'Backend-agnostic geometry -- a FAST-LIO-built map is fine here.'
     )
-    # Enables SEEDLESS localization, exactly as in fastlio_localization_l2.
-    # Without it the node can only start from a manual /initialpose: its ICP is
-    # purely local, so a seed more than a few metres out can never recover.
-    # These are the keyframe poses PGO writes beside the map -- places the robot
-    # has actually been. Also what /relocalize searches.
+    # Enables SEEDLESS localization: the ICP is purely local, so without a
+    # candidate set a seed more than a few metres out can never recover.
     declare_kf_poses_cmd = DeclareLaunchArgument(
         'keyframe_poses',
         default_value=os.path.join(nav_share, 'pcd', 'pepper_map_lc_poses.txt'),
         description='KITTI-format keyframe poses from the mapping run, used as '
                     'candidates for global localization and /relocalize. Empty '
                     'disables both (manual /initialpose only). Must come from '
-                    'the SAME run as map_pcd. The poses are backend-agnostic, '
-                    'so a FAST-LIO-built set is fine here.')
+                    'the SAME run as map_pcd; backend-agnostic like map_pcd.'
+    )
     declare_auto_init_cmd = DeclareLaunchArgument(
         'auto_initialize', default_value='false',
         description='Run the global search automatically at startup instead of '
@@ -118,60 +89,50 @@ def generate_launch_description():
         'config_file', default_value='l2lidar_rsimu.yaml',
         description='Point-LIO config under point_lio/config. l2lidar_rsimu.yaml '
                     'drives the estimator from the RealSense IMU (default); '
-                    'l2lidar_node.yaml uses the L2 s own -- see '
-                    'utils/L2_IMU/REPORT.md. Change lidar_imu_frame to match.')
+                    'l2lidar_node.yaml uses the L2 s own, which loses heading in '
+                    'slow turns (utils/L2_IMU/REPORT.md). Pair with '
+                    'lidar_imu_frame.')
     declare_lidar_imu_frame_cmd = DeclareLaunchArgument(
         'lidar_imu_frame', default_value='camera_imu_optical_frame',
         description='Static frame the estimated body corresponds to. '
-                    'camera_imu_optical_frame (default) for l2lidar_rsimu.yaml; '
+                    'camera_imu_optical_frame for l2lidar_rsimu.yaml, '
                     'l2lidar_frame_imu for l2lidar_node.yaml.')
     declare_rviz_cmd = DeclareLaunchArgument('rviz', default_value='true')
-    # A LOCALIZATION view (Fixed Frame 'map', submap vs scan overlap), not
-    # point_lio's mapping config -- that one is fixed to 'odom', where every ICP
-    # correction moves the map instead of the robot, and its /Odometry display
-    # is dead here anyway since Point-LIO publishes /aft_mapped_to_init.
     declare_rviz_cfg_cmd = DeclareLaunchArgument(
         'rviz_cfg',
+        # A LOCALIZATION view (fixed frame 'map'), not Point-LIO's mapping
+        # config -- that one is fixed to 'odom', where every ICP correction
+        # moves the map around a stationary robot.
         default_value=os.path.join(
             localization_share, 'rviz', 'localization.rviz'))
-    # false, NOT true: this is the LIVE entry point. Every wrapper in
-    # pepper_slam/launch/bag_test sets use_sim_time:='true' explicitly, so this
-    # default only ever applies on the robot -- where 'true' pins sim time at 0,
-    # so tf never resolves and nothing fuses, silently and with no error.
-    # pepper_sensor_tf's 'publisher'/'scope' are NOT derived from this -- only
-    # use_sim_time is forwarded. On a bag, pass them yourself: publisher:=none
-    # if it carries its own /tf_static, publisher:=urdf scope:=all if it does
-    # not. The bag_test wrappers already default publisher to none.
+    # false, NOT true: this is the LIVE entry point, and 'true' on the robot
+    # pins sim time at 0, so tf never resolves and nothing fuses, silently.
+    # pepper_sensor_tf's publisher/scope are NOT derived from this -- on a bag
+    # pass publisher:=none if it carries its own /tf_static, publisher:=urdf
+    # scope:=all if it does not.
     declare_use_sim_time_cmd = DeclareLaunchArgument(
         'use_sim_time', default_value='false',
-        description='false (default) on the robot; true for bag replay with ros2 bag play --clock. The bag_test wrappers set this for you.')
-    # localization_th and freq_localization USED TO BE DECLARED HERE, and
-    # map_voxel_size, max_corr_dist and fov_far below them. All five were dead:
-    # the global_localization and transform_fusion parameter dicts deliberately
-    # stay minimal so the YAML is not shadowed, and none of these names appeared
-    # in either, so passing localization_th:=0.7 on the command line did nothing
-    # while looking like it worked. Their advertised defaults had also drifted
-    # from the values actually in force (this file said 0.95 / 0.15 / 0.25 while
-    # config/localization.yaml runs 0.85 / 0.4 / 1.0). They live in
-    # config/localization.yaml, now the only place they can be set -- and
-    # localization_th and max_corr_dist are strongly coupled, since tightening
-    # the radius lowers the fitness a GOOD lock scores, so keep them in one file.
-    # Removed 2026-09-03, matching fastlio_localization_l2.launch.py.
+        description='false (default) on the robot; true for bag replay with '
+                    'ros2 bag play --clock. The bag_test wrappers set this.')
+    declare_params_cmd = DeclareLaunchArgument(
+        'params_file',
+        default_value=os.path.join(localization_share, 'config', 'localization.yaml'),
+        description='YAML of runtime tunables. Point this at the SOURCE copy '
+                    '(src/lio_localization/config/localization.yaml) to edit and '
+                    'relaunch without rebuilding.')
 
-    # base_footprint -> l2lidar_frame -> l2lidar_frame_imu (+ cams). The lio bridge
-    # needs the static base_footprint -> l2lidar_frame_imu to close odom->base_footprint.
+    # Static rig TF. The bridge needs base_footprint -> l2lidar_frame_imu from
+    # here to close odom -> base_footprint.
     sensor_tf_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(sensor_tf_share, 'launch', 'pepper_sensor_tf.launch.py')),
         launch_arguments={'use_sim_time': use_sim_time}.items())
 
-    # Point-LIO odometry ONLY (no PGO). Publishes /aft_mapped_to_init +
-    # /cloud_registered in the 'lio_init' frame; lio_odom_bridge closes
-    # lio_init -> base_footprint. 'odom' (leveled) is published as a CHILD of
-    # lio_init: transform_fusion owns map -> lio_init so it cannot also be
-    # lio_init's parent, but the costmaps and collision monitor in
-    # nav2_params_fastlio_loc.yaml require odom (raw lio_init is
-    # backend-native and not gravity-aligned).
+    # Point-LIO odometry ONLY (no PGO), in the 'lio_init' frame; its own launch
+    # starts lio_odom_bridge. 'odom' (leveled) is a CHILD of lio_init:
+    # transform_fusion owns map -> lio_init, so it cannot also be lio_init's
+    # parent -- but the costmaps need a gravity-aligned frame and raw lio_init
+    # is not one.
     point_lio_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(point_lio_share, 'launch',
@@ -186,16 +147,17 @@ def generate_launch_description():
             'level_frame_as_child': 'true',
         }.items())
 
-    # Registers /cloud_registered (odom frame) against the prior map, producing map -> lio_init.
+    # Registers /cloud_registered against the prior map -> map -> lio_init.
+    #
+    # In both nodes below: params_file FIRST, then ONLY values that must come
+    # from launch context. Anything named in both is won by the dict, which
+    # silently makes that key inert in the YAML -- so keep the dict minimal.
     global_localization = Node(
         package='lio_localization',
         executable='global_localization',
         name='point_lio_localization',
         output='screen',
         remappings=[('/Odometry', POINT_LIO_ODOM_TOPIC)],
-        # params_file FIRST, then only the values that must come from launch
-        # context. Anything appearing in BOTH would be won by this dict, which
-        # silently made the YAML inert for every tunable in it.
         parameters=[LaunchConfiguration('params_file'), {
             'use_sim_time': use_sim_time,
             'map_pcd': map_pcd,
@@ -208,16 +170,13 @@ def generate_launch_description():
         }],
     )
 
-    # Broadcasts map -> odom TF at 50 Hz from the latest correction.
+    # Broadcasts map -> lio_init from the latest correction.
     transform_fusion = Node(
         package='lio_localization',
         executable='transform_fusion',
         name='transform_fusion',
         output='screen',
         remappings=[('/Odometry', POINT_LIO_ODOM_TOPIC)],
-        # params_file FIRST, then only the values that must come from launch
-        # context. Anything appearing in BOTH would be won by this dict, which
-        # silently made the YAML inert for every tunable in it.
         parameters=[LaunchConfiguration('params_file'), {
             'use_sim_time': use_sim_time,
             'map_frame': 'map',
@@ -225,14 +184,6 @@ def generate_launch_description():
             'body_frame': 'base_footprint',   # /localization pose is map -> base
         }],
     )
-
-    declare_params_cmd = DeclareLaunchArgument(
-        'params_file',
-        default_value=os.path.join(localization_share, 'config', 'localization.yaml'),
-        description='YAML of runtime tunables. Point this at the SOURCE copy '
-                    '(src/lio_localization/config/localization.yaml) to edit and '
-                    'relaunch without rebuilding. Explicit launch arguments still '
-                    'override whatever is in the file.')
 
     ld = LaunchDescription()
     ld.add_action(declare_map_pcd_cmd)
