@@ -37,7 +37,15 @@
 
     # Voxel leaf for the live scan. 0.1 leaves only ~400 points, which is thin;
     # lowering it gives ICP more to constrain against, at CPU cost. Untested.
-    scan_voxel_size: 0.05
+    #
+    # 0.1, NOT the 0.05 that used to sit here: both localization launch files
+    # hardcoded 'scan_voxel_size': 0.1 in the node parameter dict, which is
+    # applied AFTER this file and therefore won every time. The 0.05 had never
+    # once taken effect. The dict entry is gone, so this line is now the only
+    # place the value is set -- it is written as the value that was actually
+    # running, so removing the shadowing did not silently change behaviour.
+    # Lower it here to try the finer leaf the comment above describes.
+    scan_voxel_size: 0.1
 
     # --- ICP itself ---------------------------------------------------------
     # Correspondence radius at the fine scale, AND the radius the inlier-ratio

@@ -174,7 +174,6 @@ def generate_launch_description():
                 LaunchConfiguration('auto_initialize'), value_type=bool),
             'map_frame': 'map',
             'odom_frame': 'lio_init',
-            'scan_voxel_size': 0.1,
             'fov': 6.28,        # L2 is 360 deg -> ring crop (distance only)
         }],
     )
@@ -193,7 +192,6 @@ def generate_launch_description():
             'map_frame': 'map',
             'odom_frame': 'lio_init',
             'body_frame': 'base_footprint',   # /localization pose is map -> base
-            'fusion_rate': 50.0,
         }],
     )
 

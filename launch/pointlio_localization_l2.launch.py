@@ -96,6 +96,35 @@ def generate_launch_description():
         description='Prior map .pcd to localize against (the loop-closed PGO map). '
                     'Backend-agnostic geometry -- a FAST-LIO-built map is fine here.'
     )
+    # Enables SEEDLESS localization, exactly as in fastlio_localization_l2.
+    # Without it the node can only start from a manual /initialpose: its ICP is
+    # purely local, so a seed more than a few metres out can never recover.
+    # These are the keyframe poses PGO writes beside the map -- places the robot
+    # has actually been. Also what /relocalize searches.
+    declare_kf_poses_cmd = DeclareLaunchArgument(
+        'keyframe_poses',
+        default_value=os.path.join(nav_share, 'pcd', 'pepper_map_lc_poses.txt'),
+        description='KITTI-format keyframe poses from the mapping run, used as '
+                    'candidates for global localization and /relocalize. Empty '
+                    'disables both (manual /initialpose only). Must come from '
+                    'the SAME run as map_pcd. The poses are backend-agnostic, '
+                    'so a FAST-LIO-built set is fine here.')
+    declare_auto_init_cmd = DeclareLaunchArgument(
+        'auto_initialize', default_value='false',
+        description='Run the global search automatically at startup instead of '
+                    'waiting for /initialpose or /relocalize. Off by default: a '
+                    'silent lock onto the wrong place is worse than waiting.')
+    declare_config_file_cmd = DeclareLaunchArgument(
+        'config_file', default_value='l2lidar_rsimu.yaml',
+        description='Point-LIO config under point_lio/config. l2lidar_rsimu.yaml '
+                    'drives the estimator from the RealSense IMU (default); '
+                    'l2lidar_node.yaml uses the L2 s own -- see '
+                    'utils/L2_IMU/REPORT.md. Change lidar_imu_frame to match.')
+    declare_lidar_imu_frame_cmd = DeclareLaunchArgument(
+        'lidar_imu_frame', default_value='camera_imu_optical_frame',
+        description='Static frame the estimated body corresponds to. '
+                    'camera_imu_optical_frame (default) for l2lidar_rsimu.yaml; '
+                    'l2lidar_frame_imu for l2lidar_node.yaml.')
     declare_rviz_cmd = DeclareLaunchArgument('rviz', default_value='true')
     # A LOCALIZATION view (Fixed Frame 'map', submap vs scan overlap), not
     # point_lio's mapping config -- that one is fixed to 'odom', where every ICP
@@ -151,6 +180,8 @@ def generate_launch_description():
             'rviz': rviz,
             'rviz_cfg': rviz_cfg,
             'use_sim_time': use_sim_time,
+            'config_file': LaunchConfiguration('config_file'),
+            'lidar_imu_frame': LaunchConfiguration('lidar_imu_frame'),
             'bridge_level_frame': 'true',
             'level_frame_as_child': 'true',
         }.items())
@@ -168,9 +199,11 @@ def generate_launch_description():
         parameters=[LaunchConfiguration('params_file'), {
             'use_sim_time': use_sim_time,
             'map_pcd': map_pcd,
+            'keyframe_poses': LaunchConfiguration('keyframe_poses'),
+            'auto_initialize': ParameterValue(
+                LaunchConfiguration('auto_initialize'), value_type=bool),
             'map_frame': 'map',
             'odom_frame': 'lio_init',
-            'scan_voxel_size': 0.1,
             'fov': 6.28,        # L2 is 360 deg -> ring crop (distance only)
         }],
     )
@@ -190,7 +223,6 @@ def generate_launch_description():
             'map_frame': 'map',
             'odom_frame': 'lio_init',
             'body_frame': 'base_footprint',   # /localization pose is map -> base
-            'fusion_rate': 50.0,
         }],
     )
 
@@ -204,6 +236,10 @@ def generate_launch_description():
 
     ld = LaunchDescription()
     ld.add_action(declare_map_pcd_cmd)
+    ld.add_action(declare_kf_poses_cmd)
+    ld.add_action(declare_auto_init_cmd)
+    ld.add_action(declare_config_file_cmd)
+    ld.add_action(declare_lidar_imu_frame_cmd)
     ld.add_action(declare_rviz_cmd)
     ld.add_action(declare_rviz_cfg_cmd)
     ld.add_action(declare_use_sim_time_cmd)
