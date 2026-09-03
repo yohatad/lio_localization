@@ -89,7 +89,6 @@ def generate_launch_description():
     rviz = LaunchConfiguration('rviz')
     rviz_cfg = LaunchConfiguration('rviz_cfg')
     use_sim_time = LaunchConfiguration('use_sim_time')
-    localization_th = LaunchConfiguration('localization_th')
 
     declare_map_pcd_cmd = DeclareLaunchArgument(
         'map_pcd',
@@ -110,28 +109,25 @@ def generate_launch_description():
     # pepper_slam/launch/bag_test sets use_sim_time:='true' explicitly, so this
     # default only ever applies on the robot -- where 'true' pins sim time at 0,
     # so tf never resolves and nothing fuses, silently and with no error.
-    # It also feeds the sensor_tf scope derivation: false -> 'mount', correct
-    # live because the RealSense driver publishes its own camera edges (adding a
-    # second copy is the nondeterministic-latch problem sensor_tf.yaml warns of).
+    # pepper_sensor_tf's 'publisher'/'scope' are NOT derived from this -- only
+    # use_sim_time is forwarded. On a bag, pass them yourself: publisher:=none
+    # if it carries its own /tf_static, publisher:=urdf scope:=all if it does
+    # not. The bag_test wrappers already default publisher to none.
     declare_use_sim_time_cmd = DeclareLaunchArgument(
         'use_sim_time', default_value='false',
         description='false (default) on the robot; true for bag replay with ros2 bag play --clock. The bag_test wrappers set this for you.')
-    declare_localization_th_cmd = DeclareLaunchArgument(
-        'localization_th', default_value='0.95',
-        description='Min ICP inlier-ratio fitness to accept a match. 0.90 was '
-                    'upstream\'s value and is too strict for the L2 on this rig: '
-                    'measured 0.793 on bags/July_22, so EVERY match was rejected '
-                    'and no map -> lio_init was ever published. At 0.70 the same '
-                    'bag locks at 0.978. Raise it if you see it locking onto the '
-                    'wrong place; lower it further if it never locks at all.')
-    declare_freq_cmd = DeclareLaunchArgument(
-        'freq_localization', default_value='2.0',
-        description='ICP corrections per second. Upstream shipped 0.5 Hz, which '
-                    'leaves the pose frozen for 2 s at a time -- on a moving '
-                    'robot the next ICP then starts from a stale seed. Each '
-                    'match measured 25-75 ms here, so 2 Hz is ~10% duty cycle '
-                    'and 5 Hz is still comfortable. Raise for faster motion, '
-                    'lower if CPU-bound.')
+    # localization_th and freq_localization USED TO BE DECLARED HERE, and
+    # map_voxel_size, max_corr_dist and fov_far below them. All five were dead:
+    # the global_localization and transform_fusion parameter dicts deliberately
+    # stay minimal so the YAML is not shadowed, and none of these names appeared
+    # in either, so passing localization_th:=0.7 on the command line did nothing
+    # while looking like it worked. Their advertised defaults had also drifted
+    # from the values actually in force (this file said 0.95 / 0.15 / 0.25 while
+    # config/localization.yaml runs 0.85 / 0.4 / 1.0). They live in
+    # config/localization.yaml, now the only place they can be set -- and
+    # localization_th and max_corr_dist are strongly coupled, since tightening
+    # the radius lowers the fitness a GOOD lock scores, so keep them in one file.
+    # Removed 2026-09-03, matching fastlio_localization_l2.launch.py.
 
     # base_footprint -> l2lidar_frame -> l2lidar_frame_imu (+ cams). The lio bridge
     # needs the static base_footprint -> l2lidar_frame_imu to close odom->base_footprint.
@@ -198,38 +194,6 @@ def generate_launch_description():
         }],
     )
 
-    declare_mapvox_cmd = DeclareLaunchArgument(
-        'map_voxel_size', default_value='0.15',
-        description='Voxel leaf the PRIOR MAP is downsampled to on load. This '
-                    'is the precision floor for the whole stack: ICP cannot '
-                    'localize finer than the map it matches against. Upstream '
-                    'shipped 0.4 m, and measured map->odom corrections sat at '
-                    '150-370 mm -- the same scale. Smaller = finer but more '
-                    'points and slower ICP.')
-
-    declare_corr_cmd = DeclareLaunchArgument(
-        'max_corr_dist', default_value='0.25',
-        description='ICP correspondence radius at the fine scale, and the radius '
-                    'the inlier-ratio fitness is measured over -- deliberately the '
-                    'same number, so fitness means "fraction that actually aligned" '
-                    'rather than "fraction within a metre of anything". Upstream '
-                    'used 1.0 m, which on large flat walls lets the solution slide '
-                    'along the surface while every point keeps a partner: measured '
-                    '423 mm of zero-mean jitter at fitness 0.98. NOTE this couples '
-                    'to localization_th -- tightening the radius lowers fitness, so '
-                    'the two must be tuned together.')
-
-    declare_fovfar_cmd = DeclareLaunchArgument(
-        'fov_far', default_value='10.0',
-        description='Radius (m) the prior map is cropped to around the current '
-                    'estimate each cycle -- the SEARCH AREA. ICP only ever sees '
-                    'inside this ball, so a seed further off than this can never '
-                    'recover. Bigger = more tolerant of a bad initial pose, but '
-                    'more map points per ICP and more chance of latching onto a '
-                    'similar-looking region elsewhere. The L2 itself only returns '
-                    'to ~30 m, so beyond that you are adding map with no scan to '
-                    'match it against.')
-
     declare_params_cmd = DeclareLaunchArgument(
         'params_file',
         default_value=os.path.join(localization_share, 'config', 'localization.yaml'),
@@ -243,11 +207,6 @@ def generate_launch_description():
     ld.add_action(declare_rviz_cmd)
     ld.add_action(declare_rviz_cfg_cmd)
     ld.add_action(declare_use_sim_time_cmd)
-    ld.add_action(declare_localization_th_cmd)
-    ld.add_action(declare_freq_cmd)
-    ld.add_action(declare_mapvox_cmd)
-    ld.add_action(declare_corr_cmd)
-    ld.add_action(declare_fovfar_cmd)
     ld.add_action(declare_params_cmd)
     ld.add_action(OpaqueFunction(function=_check_map_pcd_exists))
     ld.add_action(sensor_tf_launch)

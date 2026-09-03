@@ -94,9 +94,10 @@ def generate_launch_description():
     # pepper_slam/launch/bag_test sets use_sim_time:='true' explicitly, so this
     # default only ever applies on the robot -- where 'true' pins sim time at 0,
     # so tf never resolves and nothing fuses, silently and with no error.
-    # It also feeds the sensor_tf scope derivation: false -> 'mount', correct
-    # live because the RealSense driver publishes its own camera edges (adding a
-    # second copy is the nondeterministic-latch problem sensor_tf.yaml warns of).
+    # pepper_sensor_tf's 'publisher'/'scope' are NOT derived from this -- only
+    # use_sim_time is forwarded. On a bag, pass them yourself: publisher:=none
+    # if it carries its own /tf_static, publisher:=urdf scope:=all if it does
+    # not. The bag_test wrappers already default publisher to none.
     declare_use_sim_time_cmd = DeclareLaunchArgument(
         'use_sim_time', default_value='false',
         description='false (default) on the robot; true for bag replay with ros2 bag play --clock. The bag_test wrappers set this for you.')
@@ -122,13 +123,13 @@ def generate_launch_description():
 
     # base_footprint -> l2lidar_frame -> l2lidar_frame_imu (+ cams). The lio bridge
     # needs the static base_footprint -> l2lidar_frame_imu to close odom->base_footprint.
-    # scope must be 'all' on BAG REPLAY and 'mount' on the robot, and the two
-    # answer the same question: is a RealSense driver running? Derived from
-    # use_sim_time so it cannot be forgotten -- which matters now that the
-    # default config is l2_rsimu.yaml, whose body frame is
-    # camera_imu_optical_frame. Under the 'mount' default that frame is never
-    # published on a bag (no driver), so lio_odom_bridge cannot close
-    # odom -> base_footprint and the tree comes up in two halves.
+    # Only use_sim_time is forwarded, so scope keeps its own 'mount' default.
+    # That is right on the robot, where the RealSense driver publishes the
+    # camera edges itself. On a bag there is no driver, and the default config
+    # l2_rsimu.yaml names camera_imu_optical_frame as the body frame, so pass
+    # publisher:=urdf scope:=all unless the bag carries its own /tf_static --
+    # otherwise lio_odom_bridge cannot close odom -> base_footprint and the
+    # tree comes up in two halves.
     sensor_tf_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(sensor_tf_share, 'launch', 'pepper_sensor_tf.launch.py')),
